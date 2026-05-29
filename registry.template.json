@@ -1,0 +1,263 @@
+{
+  "_comment": "Native multi-LLM harness registry. Costs are USD per 1,000,000 tokens (in/out). Edit freely. Opus 4.8 reference: ~15/75 per 1M. Trust is execution-only \u2014 NONE of these are for orchestration or whole-project context.",
+  "version": 1,
+  "providers": {
+    "deepseek": {
+      "env": [
+        "DEEPSEEK_API_KEY"
+      ],
+      "base_url": "https://api.deepseek.com/v1",
+      "openai_compatible": true
+    },
+    "kimi": {
+      "env": [
+        "MOONSHOT_API_KEY",
+        "KIMI_API_KEY"
+      ],
+      "base_url": "https://api.moonshot.ai/v1",
+      "openai_compatible": true
+    },
+    "zai": {
+      "env": [
+        "ZAI_API_KEY"
+      ],
+      "base_url": "https://api.z.ai/api/paas/v4",
+      "openai_compatible": true
+    },
+    "gemini": {
+      "env": [
+        "GOOGLE_API_KEY",
+        "GEMINI_API_KEY"
+      ],
+      "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+      "openai_compatible": true
+    },
+    "openai": {
+      "env": [
+        "OPENAI_API_KEY"
+      ],
+      "base_url": "https://api.openai.com/v1",
+      "openai_compatible": true
+    },
+    "xai": {
+      "env": [
+        "XAI_API_KEY"
+      ],
+      "base_url": "https://api.x.ai/v1",
+      "openai_compatible": true
+    },
+    "openrouter": {
+      "env": [
+        "OPENROUTER_API_KEY"
+      ],
+      "base_url": "https://openrouter.ai/api/v1",
+      "openai_compatible": true,
+      "extra_headers": {
+        "HTTP-Referer": "https://claude-code.local",
+        "X-Title": "claude-code-llm-harness"
+      }
+    }
+  },
+  "models": {
+    "deepseek-chat": {
+      "provider": "deepseek",
+      "cost_in": 0.27,
+      "cost_out": 1.1,
+      "context": 64000,
+      "speed": "fast",
+      "trust": "execution",
+      "good_for": [
+        "code",
+        "verify",
+        "summarize",
+        "extract",
+        "draft"
+      ]
+    },
+    "deepseek-reasoner": {
+      "provider": "deepseek",
+      "cost_in": 0.55,
+      "cost_out": 2.19,
+      "context": 64000,
+      "speed": "slow",
+      "trust": "execution",
+      "good_for": [
+        "reason",
+        "verify",
+        "analyze"
+      ]
+    },
+    "kimi-k2.6": {
+      "provider": "kimi",
+      "cost_in": 0.6,
+      "cost_out": 2.5,
+      "context": 256000,
+      "speed": "medium",
+      "trust": "execution",
+      "good_for": [
+        "code",
+        "verify",
+        "long-context",
+        "reason"
+      ],
+      "force_temperature": 1
+    },
+    "moonshot-v1-32k": {
+      "provider": "kimi",
+      "cost_in": 1.0,
+      "cost_out": 3.0,
+      "context": 32000,
+      "speed": "medium",
+      "trust": "execution",
+      "good_for": [
+        "summarize",
+        "extract"
+      ]
+    },
+    "glm-4.6": {
+      "provider": "zai",
+      "cost_in": 0.6,
+      "cost_out": 2.2,
+      "context": 200000,
+      "speed": "medium",
+      "trust": "execution",
+      "good_for": [
+        "code",
+        "verify",
+        "reason"
+      ]
+    },
+    "glm-4.5-air": {
+      "provider": "zai",
+      "cost_in": 0.2,
+      "cost_out": 1.1,
+      "context": 128000,
+      "speed": "fast",
+      "trust": "execution",
+      "good_for": [
+        "summarize",
+        "extract",
+        "draft",
+        "cheap"
+      ]
+    },
+    "gemini-2.5-flash": {
+      "provider": "gemini",
+      "cost_in": 0.15,
+      "cost_out": 0.6,
+      "context": 1048576,
+      "speed": "fast",
+      "trust": "execution",
+      "good_for": [
+        "summarize",
+        "extract",
+        "long-context",
+        "verify",
+        "vision"
+      ]
+    },
+    "gpt-4.1-mini": {
+      "provider": "openai",
+      "cost_in": 0.4,
+      "cost_out": 1.6,
+      "context": 1047576,
+      "speed": "fast",
+      "trust": "execution",
+      "good_for": [
+        "code",
+        "verify",
+        "summarize",
+        "extract"
+      ]
+    },
+    "grok-3-mini": {
+      "provider": "xai",
+      "cost_in": 0.3,
+      "cost_out": 0.5,
+      "context": 131072,
+      "speed": "fast",
+      "trust": "execution",
+      "good_for": [
+        "reason",
+        "verify",
+        "analyze"
+      ]
+    },
+    "gemini-3.5-flash": {
+      "provider": "gemini",
+      "cost_in": 0.15,
+      "cost_out": 0.6,
+      "context": 1048576,
+      "speed": "fast",
+      "trust": "execution",
+      "good_for": [
+        "summarize",
+        "extract",
+        "long-context",
+        "verify"
+      ]
+    },
+    "gemini-2.5-flash-lite": {
+      "provider": "gemini",
+      "cost_in": 0.1,
+      "cost_out": 0.4,
+      "context": 1048576,
+      "speed": "fast",
+      "trust": "execution",
+      "good_for": [
+        "cheap",
+        "extract",
+        "draft",
+        "summarize"
+      ]
+    }
+  },
+  "aliases": {
+    "deepseek": "deepseek-chat",
+    "reasoner": "deepseek-reasoner",
+    "kimi": "kimi-k2.6",
+    "glm": "glm-4.6",
+    "gemini": "gemini-2.5-flash",
+    "flash": "gemini-3.5-flash",
+    "cheap": "glm-4.5-air",
+    "grok": "grok-3-mini",
+    "lite": "gemini-2.5-flash-lite"
+  },
+  "tasks": {
+    "code-review": [
+      "deepseek-chat",
+      "glm-4.6",
+      "kimi-k2.6"
+    ],
+    "verify": [
+      "deepseek-chat",
+      "kimi-k2.6"
+    ],
+    "summarize": [
+      "gemini-2.5-flash",
+      "glm-4.5-air",
+      "deepseek-chat"
+    ],
+    "extract": [
+      "gemini-2.5-flash",
+      "glm-4.5-air"
+    ],
+    "draft": [
+      "deepseek-chat",
+      "glm-4.5-air"
+    ],
+    "reason": [
+      "deepseek-reasoner",
+      "grok-3-mini",
+      "glm-4.6"
+    ],
+    "long-context": [
+      "gemini-2.5-flash",
+      "glm-4.6"
+    ],
+    "cheap": [
+      "glm-4.5-air",
+      "gemini-2.5-flash-lite"
+    ]
+  }
+}

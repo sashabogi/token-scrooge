@@ -1,0 +1,616 @@
+#!/usr/bin/env python3
+"""
+scrooge — make the cheap models do the grunt work.
+
+Routes a single task to a CHEAP external model (DeepSeek/Kimi/ZAI-GLM/Gemini/
+OpenAI/xAI/OpenRouter, …) via the OpenAI-compatible chat API. Your expensive
+orchestrator (Claude Opus, etc.) stays in charge; this is ONLY for disconnected,
+individually-scoped execution work — drafts, summaries, extraction, judgment.
+
+TRANSPARENCY (the whole point): every call prints a loud banner to STDERR and
+appends to a cost ledger. The model's text goes to STDOUT only.
+
+Usage:
+  scrooge "prompt"                          # default model
+  scrooge --model kimi "prompt"             # force a model (alias or full id)
+  scrooge --task code-review "prompt"       # pick cheapest capable model for a task
+  scrooge --json --system "..." "prompt"    # JSON-object output + system prompt
+  echo "long input" | scrooge --task summarize   # prompt from stdin (or - )
+  scrooge models <provider>                 # list live model ids from a provider
+  scrooge list                              # show registry (providers/models/tasks)
+  scrooge ledger [--since 24h|7d|all]       # usage + cost totals, savings vs Opus
+
+Config:  $SCROOGE_HOME (default ~/.token-scrooge) holds registry.json + calls.jsonl
+Keys:    read from the environment; optionally also from $SCROOGE_ENV_FILE (KEY=VALUE)
+Exit: 0 ok, non-zero on error (message to stderr).
+"""
+import sys, os, json, time, argparse, urllib.request, urllib.error, re, shutil
+
+HOME = os.path.expanduser("~")
+SCROOGE_DIR = os.environ.get("SCROOGE_HOME", os.path.join(HOME, ".token-scrooge"))
+REGISTRY = os.path.join(SCROOGE_DIR, "registry.json")
+LEDGER = os.path.join(SCROOGE_DIR, "calls.jsonl")
+ENV_FALLBACK = os.environ.get("SCROOGE_ENV_FILE", "")   # optional extra KEY=VALUE file (e.g. a proxy .env)
+OPUS_IN, OPUS_OUT = 15.0, 75.0   # $/1M reference for savings math (Opus 4.x)
+
+# ---- ANSI (stderr only) -------------------------------------------------
+def _c(code, s):
+    return s if not sys.stderr.isatty() else "\033[%sm%s\033[0m" % (code, s)
+ORANGE = lambda s: _c("38;5;208", s)
+DIM = lambda s: _c("2", s)
+RED = lambda s: _c("31", s)
+
+def err(*a):
+    sys.stderr.write(" ".join(str(x) for x in a) + "\n")
+
+# ---- key loading --------------------------------------------------------
+def _load_env_file(path):
+    """Merge KEY=VALUE lines from a file into os.environ (no override of existing)."""
+    if not path or not os.path.exists(path):
+        return
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                if k.startswith("export "):
+                    k = k[len("export "):].strip()
+                v = v.strip().strip('"').strip("'")
+                if k and k not in os.environ:
+                    os.environ[k] = v
+    except Exception as e:
+        err(DIM("[scrooge] could not read %s: %s" % (path, e)))
+
+def load_env_fallback():
+    """Keys come from the environment, plus (no override): ~/.token-scrooge/.env
+    (written by `scrooge setup`) and an optional $SCROOGE_ENV_FILE."""
+    _load_env_file(os.path.join(SCROOGE_DIR, ".env"))
+    _load_env_file(ENV_FALLBACK)
+
+def load_registry():
+    with open(REGISTRY) as fh:
+        return json.load(fh)
+
+def provider_key(reg, provider):
+    p = reg["providers"].get(provider) or {}
+    for name in p.get("env", []):
+        if os.environ.get(name):
+            return os.environ[name]
+    return None
+
+# ---- model resolution ---------------------------------------------------
+def resolve_model(reg, model=None, task=None):
+    """Return (model_id, provider) or raise."""
+    if model:
+        model = reg.get("aliases", {}).get(model, model)
+        if model in reg["models"]:
+            return model, reg["models"][model]["provider"]
+        if "/" in model:   # provider/model form, e.g. openrouter explicit
+            prov, _ = model.split("/", 1)
+            if prov in reg["providers"]:
+                return model, prov
+        # unknown but maybe valid for openrouter
+        raise SystemExit("Unknown model '%s'. Try: scrooge list" % model)
+    if task:
+        cands = reg.get("tasks", {}).get(task)
+        if not cands:
+            raise SystemExit("Unknown task '%s'. Tasks: %s" % (task, ", ".join(reg.get("tasks", {}))))
+        for mid in cands:
+            prov = reg["models"][mid]["provider"]
+            if provider_key(reg, prov):
+                return mid, prov
+        raise SystemExit("No live API key for any model serving task '%s'." % task)
+    # default
+    return resolve_model(reg, model="deepseek-chat")
+
+# ---- HTTP ---------------------------------------------------------------
+def http_post(url, headers, payload, timeout=120):
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode())
+
+def http_get(url, headers, timeout=30):
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode())
+
+# ---- ledger -------------------------------------------------------------
+def append_ledger(entry):
+    try:
+        os.makedirs(SCROOGE_DIR, exist_ok=True)
+        with open(LEDGER, "a") as fh:
+            fh.write(json.dumps(entry) + "\n")
+        # return 1-based line count cheaply
+        with open(LEDGER) as fh:
+            return sum(1 for _ in fh)
+    except Exception:
+        return None
+
+def cost_usd(reg, model, tin, tout):
+    m = reg["models"].get(model.split("/")[-1]) or reg["models"].get(model)
+    if not m:
+        return 0.0
+    return (tin / 1e6) * m.get("cost_in", 0) + (tout / 1e6) * m.get("cost_out", 0)
+
+# ---- commands -----------------------------------------------------------
+def cmd_call(reg, args):
+    model, provider = resolve_model(reg, args.model, args.task)
+    key = provider_key(reg, provider)
+    if not key:
+        raise SystemExit("No API key set for provider '%s' (env: %s)" %
+                         (provider, ", ".join(reg["providers"][provider].get("env", []))))
+    prompt = args.prompt
+    if prompt in (None, "-"):
+        prompt = sys.stdin.read()
+    if not prompt or not prompt.strip():
+        raise SystemExit("Empty prompt.")
+
+    base = reg["providers"][provider]["base_url"].rstrip("/")
+    url = base + "/chat/completions"
+    headers = {"Authorization": "Bearer " + key, "Content-Type": "application/json"}
+    headers.update(reg["providers"][provider].get("extra_headers", {}))
+
+    msgs = []
+    if args.system:
+        msgs.append({"role": "system", "content": args.system})
+    msgs.append({"role": "user", "content": prompt})
+    # Per-model constraint: some models (e.g. kimi-k2.6) require a fixed temperature.
+    mcfg = reg["models"].get(model, {})
+    temp = mcfg["force_temperature"] if "force_temperature" in mcfg else args.temperature
+    payload = {"model": model.split("/", 1)[1] if (provider == "openrouter" and "/" in model) else model,
+               "messages": msgs, "temperature": temp}
+    if provider == "openrouter":
+        payload["model"] = model if "/" in model else model
+    if args.max_tokens:
+        payload["max_tokens"] = args.max_tokens
+    if args.json:
+        payload["response_format"] = {"type": "json_object"}
+        if not args.system:
+            msgs.insert(0, {"role": "system", "content": "Respond ONLY with a single valid JSON object. No prose, no code fences."})
+
+    label = ("[task: %s]" % args.task) if args.task else ""
+    err(ORANGE("🪙 scrooge ▸ %s/%s %s" % (provider, model, label)))
+
+    t0 = time.time()
+    try:
+        resp = http_post(url, headers, payload)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")[:500]
+        err(RED("🪙 scrooge ✗ %s/%s HTTP %s: %s" % (provider, model, e.code, body)))
+        append_ledger({"ts": int(t0), "provider": provider, "model": model, "task": args.task,
+                       "ok": False, "error": "HTTP %s" % e.code, "duration_ms": int((time.time()-t0)*1000)})
+        raise SystemExit(2)
+    except Exception as e:
+        err(RED("🪙 scrooge ✗ %s/%s: %s" % (provider, model, e)))
+        append_ledger({"ts": int(t0), "provider": provider, "model": model, "task": args.task,
+                       "ok": False, "error": str(e), "duration_ms": int((time.time()-t0)*1000)})
+        raise SystemExit(2)
+
+    dt = time.time() - t0
+    choice = (resp.get("choices") or [{}])[0]
+    msg = choice.get("message", {}) or {}
+    text = msg.get("content") or msg.get("reasoning_content") or ""
+    usage = resp.get("usage", {}) or {}
+    tin = usage.get("prompt_tokens") or 0
+    tout = usage.get("completion_tokens") or 0
+    c = cost_usd(reg, model, tin, tout)
+    line_no = append_ledger({"ts": int(t0), "provider": provider, "model": model, "task": args.task,
+                             "tokens_in": tin, "tokens_out": tout, "cost_usd": round(c, 6),
+                             "duration_ms": int(dt*1000), "ok": True, "prompt_chars": len(prompt)})
+    err(ORANGE("🪙 scrooge ✓ %s/%s · %d→%d tok · ~$%.5f · %.1fs%s" %
+               (provider, model, tin, tout, c, dt, (" · ledger#%d" % line_no) if line_no else "")))
+    sys.stdout.write(text)
+    if not text.endswith("\n"):
+        sys.stdout.write("\n")
+
+def cmd_models(reg, args):
+    provider = args.provider
+    if provider not in reg["providers"]:
+        raise SystemExit("Unknown provider. Known: %s" % ", ".join(reg["providers"]))
+    key = provider_key(reg, provider)
+    if not key:
+        raise SystemExit("No key for %s" % provider)
+    base = reg["providers"][provider]["base_url"].rstrip("/")
+    headers = {"Authorization": "Bearer " + key}
+    headers.update(reg["providers"][provider].get("extra_headers", {}))
+    data = http_get(base + "/models", headers)
+    ids = sorted(m.get("id", "?") for m in (data.get("data") or []))
+    err(DIM("[scrooge] %d models from %s:" % (len(ids), provider)))
+    for i in ids:
+        print(i)
+
+def cmd_list(reg, args):
+    print("PROVIDERS (live = key present):")
+    for p, cfg in reg["providers"].items():
+        live = "✓" if provider_key(reg, p) else "✗"
+        print("  %s %-11s %s" % (live, p, cfg["base_url"]))
+    print("\nMODELS ($/1M in/out · trust · good_for):")
+    for m, c in reg["models"].items():
+        live = "✓" if provider_key(reg, c["provider"]) else "✗"
+        print("  %s %-24s %5.2f/%-5.2f %-9s %s" % (live, m, c.get("cost_in",0), c.get("cost_out",0),
+              c.get("trust",""), ",".join(c.get("good_for", []))))
+    print("\nTASKS:")
+    for t, ms in reg.get("tasks", {}).items():
+        print("  %-13s → %s" % (t, ", ".join(ms)))
+    print("\nALIASES:", ", ".join("%s=%s" % (k, v) for k, v in reg.get("aliases", {}).items()))
+
+def parse_since(s):
+    if s == "all":
+        return 0
+    m = re.match(r"(\d+)([hd])", s or "24h")
+    if not m:
+        return 0
+    n, u = int(m.group(1)), m.group(2)
+    return time.time() - n * (3600 if u == "h" else 86400)
+
+def cmd_ledger(reg, args):
+    since = parse_since(args.since)
+    if not os.path.exists(LEDGER):
+        print("No calls logged yet."); return
+    rows = []
+    with open(LEDGER) as fh:
+        for line in fh:
+            try:
+                o = json.loads(line)
+            except Exception:
+                continue
+            if o.get("ts", 0) >= since and o.get("ok"):
+                rows.append(o)
+    if not rows:
+        print("No successful calls in window '%s'." % args.since); return
+    orch = reg.get("orchestrator") or {}
+    base_in = orch.get("cost_in", OPUS_IN)
+    base_out = orch.get("cost_out", OPUS_OUT)
+    orch_name = orch.get("name", "Opus")
+    total_cost = sum(r.get("cost_usd", 0) for r in rows)
+    tin = sum(r.get("tokens_in", 0) for r in rows)
+    tout = sum(r.get("tokens_out", 0) for r in rows)
+    orch_equiv = (tin/1e6)*base_in + (tout/1e6)*base_out
+    by = {}
+    for r in rows:
+        k = "%s/%s" % (r.get("provider"), r.get("model"))
+        d = by.setdefault(k, {"n": 0, "cost": 0, "tin": 0, "tout": 0})
+        d["n"] += 1; d["cost"] += r.get("cost_usd", 0)
+        d["tin"] += r.get("tokens_in", 0); d["tout"] += r.get("tokens_out", 0)
+    print("SCROOGE LEDGER — window: %s   (%d calls)" % (args.since, len(rows)))
+    print("  tokens: %s in / %s out" % (f"{tin:,}", f"{tout:,}"))
+    print("  spent on cheap models: $%.4f" % total_cost)
+    print("  same tokens on %s: ~$%.2f" % (orch_name, orch_equiv))
+    if orch_equiv > 0:
+        print("  → saved ~$%.2f (%.0f%% cheaper)" % (orch_equiv - total_cost, 100*(1 - total_cost/orch_equiv)))
+    print("\n  by model:")
+    for k, d in sorted(by.items(), key=lambda x: -x[1]["cost"]):
+        print("    %-28s %3d calls  $%.4f  (%s→%s tok)" % (k, d["n"], d["cost"], f"{d['tin']:,}", f"{d['tout']:,}"))
+
+# ---- pretty UI (stdlib only: truecolor + box-drawing + arrow menu) ------
+def _uitty(): return sys.stdout.isatty() and os.environ.get("TERM", "") not in ("", "dumb") and not os.environ.get("NO_COLOR")
+def _rgb(r, g, b, s): return ("\033[38;2;%d;%d;%dm%s\033[0m" % (r, g, b, s)) if _uitty() else s
+GOLD  = lambda s: _rgb(240, 196, 80, s)
+AMBER = lambda s: _rgb(190, 145, 45, s)
+GREYc = lambda s: _rgb(128, 128, 138, s)
+OKc   = lambda s: _rgb(90, 200, 130, s)
+ERRc  = lambda s: _rgb(230, 100, 100, s)
+def BOLD(s):  return ("\033[1m%s\033[0m" % s) if _uitty() else s
+def GREEN(s): return OKc(s)
+_ANSI = re.compile(r"\033\[[0-9;]*m")
+def _vlen(s): return len(_ANSI.sub("", s))
+UW = 60  # panel inner width
+
+def _box(lines, color=AMBER, pad=2):
+    """Draw a rounded box. Content lines must be ASCII-display-width (ANSI ok)."""
+    top = color("╭" + "─" * UW + "╮"); bot = color("╰" + "─" * UW + "╯")
+    body = []
+    for ln in lines:
+        space = UW - pad - _vlen(ln)
+        body.append(color("│") + " " * pad + ln + " " * max(0, space) + color("│"))
+    return "\n".join([top] + body + [bot])
+
+def _banner():
+    if not _uitty():
+        print("Token Scrooge — setup"); return
+    print()
+    print(_box([GOLD(BOLD("TOKEN  SCROOGE")) + GREYc("   $ make the cheap models do the grunt work"),
+                GREYc("one orchestrator in charge · cheap labor with receipts")], color=GOLD))
+
+def _step(n, total, title, sub=""):
+    print()
+    print(" " + GOLD(BOLD("%d/%d" % (n, total))) + "  " + BOLD(title) + (("   " + GREYc(sub)) if sub else ""))
+    print(" " + AMBER("─" * UW))
+
+def _menu(options, default=0):
+    """options: list of (label, hint). Arrow-key select with ❯; numbered fallback when not a TTY."""
+    if not (sys.stdin.isatty() and _uitty()):
+        for i, (lab, hint) in enumerate(options, 1):
+            print("   %d) %s  %s" % (i, lab, GREYc(hint)))
+        c = _ask("   Select [1-%d] (default %d): " % (len(options), default + 1), str(default + 1))
+        try: return max(1, min(len(options), int(c))) - 1
+        except ValueError: return default
+    import termios, tty
+    idx = default; fd = sys.stdin.fileno(); old = termios.tcgetattr(fd)
+    def draw(first=False):
+        if not first: sys.stdout.write("\033[%dA" % len(options))
+        for i, (lab, hint) in enumerate(options):
+            sel = i == idx
+            ptr = GOLD("❯") if sel else " "
+            txt = GOLD(BOLD(lab)) if sel else lab
+            sys.stdout.write("\r\033[K   %s %s  %s\n" % (ptr, txt, GREYc(hint)))
+        sys.stdout.flush()
+    try:
+        sys.stdout.write(GREYc("   (↑/↓ to move, Enter to select)\n"))
+        draw(first=True)
+        tty.setcbreak(fd)
+        while True:
+            ch = sys.stdin.read(1)
+            if ch in ("\r", "\n"): break
+            elif ch == "\x1b":
+                seq = sys.stdin.read(2)
+                if seq == "[A": idx = (idx - 1) % len(options); draw()
+                elif seq == "[B": idx = (idx + 1) % len(options); draw()
+            elif ch == "k": idx = (idx - 1) % len(options); draw()
+            elif ch == "j": idx = (idx + 1) % len(options); draw()
+            elif ch.isdigit() and 1 <= int(ch) <= len(options): idx = int(ch) - 1; draw()
+            elif ch == "\x03": raise KeyboardInterrupt
+    except Exception:
+        return default
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    return idx
+
+def _spin(label, fn):
+    """Run fn() while animating a spinner on `label`; return fn()'s result. Plain when not a TTY."""
+    if not _uitty():
+        return fn()
+    import threading, itertools, time as _t
+    box = {}
+    th = threading.Thread(target=lambda: box.__setitem__("r", fn())); th.start()
+    for fr in itertools.cycle("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"):
+        if not th.is_alive(): break
+        sys.stdout.write("\r   %s %s" % (GOLD(fr), label)); sys.stdout.flush()
+        _t.sleep(0.08)
+    th.join()
+    sys.stdout.write("\r\033[K")
+    return box.get("r")
+
+# Orchestrator presets: (key, label, $/1M in, $/1M out). The orchestrator is the
+# model YOU drive your agent with; it only sets the ledger's savings baseline
+# (Scrooge never calls it). Prices are approximate and editable in registry.json.
+# Ordered premium → budget: a cheap flagship can orchestrate for the truly thrifty.
+ORCHESTRATORS = [
+    # frontier / premium
+    ("claude-opus",    "Claude Opus",            15.0, 75.0),
+    ("claude-sonnet",  "Claude Sonnet",           3.0, 15.0),
+    ("gpt-flagship",   "OpenAI GPT (flagship)",  10.0, 30.0),
+    ("gemini-pro",     "Gemini Pro",              1.25, 10.0),
+    ("grok",           "xAI Grok",                3.0, 15.0),
+    ("mistral-large",  "Mistral Large",           2.0,  6.0),
+    # budget flagships (cheap enough to orchestrate on a tight budget)
+    ("deepseek",       "DeepSeek V3 / R1  · budget", 0.27, 1.10),
+    ("kimi",           "Kimi K2 (Moonshot) · budget", 0.60, 2.50),
+    ("qwen",           "Qwen Max · budget",       1.60, 6.40),
+    ("glm",            "Zhipu GLM-4.6 · budget",  0.60, 2.20),
+    ("custom",         "Other flagship / custom", 0.0,  0.0),
+]
+
+def _ask(prompt, default=""):
+    try:
+        v = input(prompt).strip()
+        return v or default
+    except EOFError:
+        return default
+
+def _ask_secret(prompt):
+    if sys.stdin.isatty():
+        import getpass
+        try:
+            return getpass.getpass(prompt).strip()
+        except Exception:
+            return _ask(prompt)
+    return _ask(prompt)  # piped (non-interactive / tests)
+
+def _ensure_registry():
+    os.makedirs(SCROOGE_DIR, exist_ok=True)
+    if os.path.exists(REGISTRY):
+        return
+    here = os.path.dirname(os.path.realpath(__file__))
+    for cand in (os.path.join(SCROOGE_DIR, "registry.template.json"),
+                 os.path.join(here, "..", "registry.template.json")):
+        if os.path.exists(cand):
+            shutil.copy(cand, REGISTRY)
+            return
+    raise SystemExit("No registry template found near %s — reinstall Token Scrooge." % here)
+
+def _write_env_file(new_keys):
+    """Merge new KEY=VALUE pairs into ~/.token-scrooge/.env, preserving existing, chmod 600."""
+    path = os.path.join(SCROOGE_DIR, ".env")
+    existing = {}
+    if os.path.exists(path):
+        for line in open(path):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1); existing[k.strip()] = v.strip()
+    existing.update({k: v for k, v in new_keys.items() if v})
+    with open(path, "w") as fh:
+        fh.write("# Token Scrooge — provider API keys. Loaded automatically by `scrooge`.\n")
+        fh.write("# Created by `scrooge setup`. Keep private (this file is chmod 600).\n")
+        for k, v in existing.items():
+            fh.write("%s=%s\n" % (k, v))
+    os.chmod(path, 0o600)
+    return path
+
+def _ping(reg, provider):
+    """Live-test a provider key by listing its models. Returns (ok, detail)."""
+    key = provider_key(reg, provider)
+    if not key:
+        return False, "no key"
+    base = reg["providers"][provider]["base_url"].rstrip("/")
+    headers = {"Authorization": "Bearer " + key}
+    headers.update(reg["providers"][provider].get("extra_headers", {}))
+    try:
+        data = http_get(base + "/models", headers, timeout=15)
+        n = len(data.get("data", []) or [])
+        return True, "%d models" % n
+    except urllib.error.HTTPError as e:
+        return False, "HTTP %s" % e.code
+    except Exception as e:
+        return False, str(e)[:40]
+
+def _install_claude_gate():
+    """Opt-in: copy the verification gate (hook + agent + skill) into ~/.claude and
+    wire the Stop/SubagentStop hook idempotently. Non-destructive."""
+    repo = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    claude = os.path.join(HOME, ".claude")
+    copies = [
+        (os.path.join(repo, "hooks", "verify-done-gate.py"), os.path.join(claude, "hooks", "verify-done-gate.py")),
+        (os.path.join(repo, "agents", "adversarial-verifier.md"), os.path.join(claude, "agents", "adversarial-verifier.md")),
+        (os.path.join(repo, "skills", "diverge", "SKILL.md"), os.path.join(claude, "skills", "diverge", "SKILL.md")),
+    ]
+    for src, dst in copies:
+        if not os.path.exists(src):
+            err(RED("  skipped (missing in repo): %s" % src)); continue
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy(src, dst)
+        print("  ✓ %s" % dst.replace(HOME, "~"))
+    # merge hooks into settings.json
+    sp = os.path.join(claude, "settings.json")
+    settings = {}
+    if os.path.exists(sp):
+        try: settings = json.load(open(sp))
+        except Exception: settings = {}
+    hooks = settings.setdefault("hooks", {})
+    gate = {"type": "command", "command": "python3 %s" % os.path.join(claude, "hooks", "verify-done-gate.py")}
+    def _has(arr): return any(any("verify-done-gate.py" in h.get("command","") for h in e.get("hooks",[])) for e in arr)
+    for ev in ("Stop", "SubagentStop"):
+        arr = hooks.setdefault(ev, [])
+        if not _has(arr):
+            arr.append({"hooks": [gate]})
+    json.dump(settings, open(sp, "w"), indent=2); open(sp, "a").write("\n")
+    print("  ✓ wired verify-done-gate.py into Stop + SubagentStop (%s)" % sp.replace(HOME, "~"))
+    print(DIM("  (disable a block any time with VERIFY_DONE_GATE_OFF=1)"))
+
+def cmd_setup(args):
+    _banner()
+    _ensure_registry()
+    reg = load_registry()
+    TOTAL = 4
+
+    # 1) Orchestrator — arrow-key menu
+    _step(1, TOTAL, "Your orchestrator", "the expensive model you drive with — sets the savings baseline")
+    opts = [(label, ("$%.0f/$%.0f per 1M" % (ci, co)) if k != "custom" else "enter your own pricing")
+            for (k, label, ci, co) in ORCHESTRATORS]
+    idx = _menu(opts, default=0)
+    okey, olabel, oci, oco = ORCHESTRATORS[idx]
+    if okey == "custom":
+        olabel = _ask("   Orchestrator name: ", "Custom")
+        oci = float(_ask("   Its input  $/1M tokens: ", "15") or 15)
+        oco = float(_ask("   Its output $/1M tokens: ", "75") or 75)
+    reg["orchestrator"] = {"name": olabel, "cost_in": oci, "cost_out": oco}
+    print("   " + OKc("✓") + " orchestrator: " + GOLD(BOLD(olabel)))
+
+    # 2) Keys — show status dots, prompt only for missing
+    _step(2, TOTAL, "Provider API keys", "paste to enable · Enter to skip · detected env keys kept")
+    new_keys = {}
+    for provider, cfg in reg["providers"].items():
+        env_names = cfg.get("env", [])
+        already = next((n for n in env_names if os.environ.get(n)), None)
+        if already:
+            print("   %s %-11s %s" % (GOLD("●"), provider, GREYc("detected · " + already)))
+            continue
+        print("   %s %-11s %s" % (GREYc("○"), provider, GREYc("needs " + (env_names[0] if env_names else "key"))))
+        val = _ask_secret("       ↳ paste key (or Enter to skip): ")
+        if val:
+            new_keys[(env_names[0] if env_names else provider.upper() + "_API_KEY")] = val
+            print("       " + OKc("✓ added"))
+    env_path = _write_env_file(new_keys)
+    json.dump(reg, open(REGISTRY, "w"), indent=2); open(REGISTRY, "a").write("\n")
+    print("   " + OKc("✓") + " keys saved to " + GOLD(env_path.replace(HOME, "~")) + GREYc(" (chmod 600)"))
+
+    # 3) Live test — spinner per provider, with inline retry for failures
+    _step(3, TOTAL, "Testing live providers", "")
+    def run_tests():
+        load_env_fallback()
+        r = load_registry()
+        livec, failed = 0, []
+        for provider in r["providers"]:
+            if not provider_key(r, provider):
+                continue
+            ok, detail = _spin("testing %s …" % provider, lambda p=provider: _ping(r, p))
+            print("   %s %-11s %s" % (OKc("✓") if ok else ERRc("✗"), provider, (OKc(detail) if ok else ERRc(detail))))
+            if ok: livec += 1
+            else: failed.append(provider)
+        return r, livec, failed
+    reg, live, failed = run_tests()
+    # A failure is almost always a wrong paste or a stale/auto-detected key.
+    # Offer to re-enter the right key and re-test, in place, until resolved.
+    while failed and sys.stdin.isatty():
+        print("   " + AMBER("%d provider(s) failed — usually a wrong or stale key." % len(failed)))
+        if not _ask("   Re-enter keys for the failed ones now? " + GREYc("[Y/n]") + " ", "y").lower().startswith("y"):
+            break
+        fixes = {}
+        for provider in failed:
+            envn = reg["providers"][provider].get("env", [])
+            primary = envn[0] if envn else provider.upper() + "_API_KEY"
+            val = _ask_secret("   %s → paste %s (Enter to skip): " % (provider, primary))
+            if val:
+                fixes[primary] = val
+                os.environ[primary] = val  # picked up on the next test pass
+        if not fixes:
+            break
+        _write_env_file(fixes)
+        print("   " + GREYc("re-testing…"))
+        reg, live, failed = run_tests()
+    print("   " + (OKc("● %d provider(s) live" % live) if live else ERRc("no working providers yet — add a key and re-run `scrooge setup`")))
+
+    # 4) Optional Claude Code gate
+    _step(4, TOTAL, "Claude Code verification gate", "optional")
+    print("   " + GREYc("diverge skill + adversarial-verifier agent + a Stop hook that blocks"))
+    print("   " + GREYc("'done' claims with no build/test evidence."))
+    if _ask("   Install into ~/.claude? " + GREYc("[y/N]") + " ", "n").lower().startswith("y"):
+        _install_claude_gate()
+    else:
+        print("   " + GREYc("skipped — run `scrooge setup` again any time to add it."))
+
+    # Done panel
+    print()
+    print(_box([OKc(BOLD("✓ Ready.")) + GREYc("  saving baseline: ") + GOLD(olabel),
+                "",
+                GREYc("try  ") + GOLD("scrooge list"),
+                GREYc("     ") + GOLD("scrooge --task summarize < file.md"),
+                GREYc("     ") + GOLD("scrooge ledger") + GREYc("   # spend + savings")], color=OKc))
+    print()
+
+def main():
+    load_env_fallback()
+    argv = sys.argv[1:]
+    if argv and argv[0] == "setup":
+        return cmd_setup(None)
+    reg = load_registry()
+
+    # Manual subcommand dispatch (avoids argparse subparser vs positional-prompt clash).
+    if argv and argv[0] in ("models", "list", "ledger"):
+        cmd, rest = argv[0], argv[1:]
+        if cmd == "models":
+            ap = argparse.ArgumentParser(prog="scrooge models"); ap.add_argument("provider")
+            return cmd_models(reg, ap.parse_args(rest))
+        if cmd == "list":
+            return cmd_list(reg, None)
+        if cmd == "ledger":
+            ap = argparse.ArgumentParser(prog="scrooge ledger"); ap.add_argument("--since", default="24h")
+            return cmd_ledger(reg, ap.parse_args(rest))
+
+    # Default: a model call.
+    ap = argparse.ArgumentParser(prog="scrooge")
+    ap.add_argument("prompt", nargs="?")
+    ap.add_argument("--model", "-m")
+    ap.add_argument("--task", "-t")
+    ap.add_argument("--system", "-s")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--max-tokens", type=int, dest="max_tokens")
+    ap.add_argument("--temperature", type=float, default=0.3)
+    return cmd_call(reg, ap.parse_args(argv))
+
+if __name__ == "__main__":
+    main()

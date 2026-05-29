@@ -1,0 +1,9 @@
+{
+  "name": "token-scrooge",
+  "version": "0.1.0",
+  "description": "Make the cheap models do the grunt work — delegate disconnected execution to cheap LLMs (DeepSeek/Kimi/GLM/Gemini/OpenRouter) with a cost ledger and a verification gate, while your orchestrator stays in charge.",
+  "author": { "name": "sashabogi" },
+  "homepage": "https://github.com/sashabogi/token-scrooge",
+  "license": "MIT",
+  "keywords": ["claude-code", "llm", "cost", "multi-llm", "verification", "deepseek", "gemini", "kimi", "glm"]
+}
