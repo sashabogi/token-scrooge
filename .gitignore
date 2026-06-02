@@ -3,4 +3,11 @@ __pycache__/
 *.pyc
 .DS_Store
 .env
+.env.*
 *.local
+# scrooge runtime state (normally lives in $SCROOGE_HOME, never in the repo —
+# ignored defensively so secrets/ledger can never be committed by accident)
+calls.jsonl
+registry.json
+registry.template.json.bak*
+drift-report.txt

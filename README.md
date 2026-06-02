@@ -34,13 +34,14 @@ scrooge "draft a regex for E.164 phone numbers"
 scrooge --task summarize < bigfile.md          # cheapest capable model for the task
 scrooge --model kimi --json "extract the prices as JSON"
 scrooge ledger                                 # spend + savings vs your orchestrator
+scrooge-drift                                  # is the registry still current? (run weekly)
 ```
 
 Every call prints a loud banner, so an external model never runs silently:
 
 ```
-🪙 scrooge ▸ deepseek/deepseek-chat  [task: summarize]
-🪙 scrooge ✓ deepseek/deepseek-chat · 1240→830 tok · ~$0.00041 · 1.4s · ledger#23
+🪙 scrooge ▸ deepseek/deepseek-v4-flash  [task: summarize]
+🪙 scrooge ✓ deepseek/deepseek-v4-flash · 1240→830 tok · ~$0.00041 · 1.4s · ledger#23
 ```
 
 ## What's inside
@@ -56,14 +57,14 @@ Every call prints a loud banner, so an external model never runs silently:
 ## How it works
 
 - **One OpenAI-compatible code path** covers every provider; the router is dependency-free Python (stdlib only).
-- **A capability registry** (`~/.token-scrooge/registry.json`) maps each model → provider, env var, base URL, **cost per 1M tokens**, speed, and `good_for` tags. Fully editable; `scrooge models <provider>` discovers live IDs.
+- **A capability registry** (`~/.token-scrooge/registry.json`) maps each model → provider, env var, base URL, **cost per 1M tokens**, speed, and `good_for` tags. Fully editable; `scrooge models <provider>` discovers live IDs, and `scrooge-drift` flags when the registry has fallen behind what providers actually serve (retired IDs that would fail, or newer models worth adopting) — run it weekly via cron so routing never silently rots.
 - **A cost ledger** (`~/.token-scrooge/calls.jsonl`) records every call; `scrooge ledger` totals spend and savings against *your* orchestrator's price.
 - **Bring your own keys.** Nothing is bundled. Works with whatever subset you have — even one provider.
 
 ### Orchestrators (savings baseline)
 
 Frontier: Claude Opus · Claude Sonnet · OpenAI GPT · Gemini Pro · xAI Grok · Mistral Large.
-Budget (cheap enough to orchestrate on): DeepSeek V3/R1 · Kimi K2 · Qwen Max · Zhipu GLM-4.6.
+Budget (cheap enough to orchestrate on): DeepSeek V4 · Kimi K2 · Qwen Max · Zhipu GLM-5.
 
 ### Optional: route through a proxy
 

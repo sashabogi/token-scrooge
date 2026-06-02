@@ -190,6 +190,39 @@
         "verify"
       ]
     },
+    "gpt-5-nano": {
+      "provider": "openai",
+      "cost_in": 0.05,
+      "cost_out": 0.4,
+      "context": 400000,
+      "speed": "slow",
+      "trust": "execution",
+      "good_for": [
+        "cheap",
+        "summarize",
+        "extract",
+        "draft",
+        "verify"
+      ],
+      "token_param": "max_completion_tokens",
+      "force_temperature": 1
+    },
+    "gpt-5-mini": {
+      "provider": "openai",
+      "cost_in": 0.25,
+      "cost_out": 2.0,
+      "context": 400000,
+      "speed": "fast",
+      "trust": "execution",
+      "good_for": [
+        "code",
+        "verify",
+        "reason",
+        "extract"
+      ],
+      "token_param": "max_completion_tokens",
+      "force_temperature": 1
+    },
     "gpt-4.1-mini": {
       "provider": "openai",
       "cost_in": 0.4,
@@ -199,9 +232,8 @@
       "trust": "execution",
       "good_for": [
         "code",
-        "verify",
-        "summarize",
-        "extract"
+        "extract",
+        "long-context"
       ]
     },
     "grok-4.3": {
@@ -229,36 +261,44 @@
     "flash": "gemini-3-flash-preview",
     "lite": "gemini-2.5-flash-lite",
     "cheap": "deepseek-v4-flash",
+    "nano": "gpt-5-nano",
+    "mini": "gpt-5-mini",
     "grok": "grok-4.3"
   },
   "tasks": {
     "code-review": [
       "deepseek-v4-flash",
+      "gpt-5-mini",
       "glm-4.7",
       "glm-5",
       "kimi-k2.6"
     ],
     "verify": [
       "deepseek-v4-flash",
+      "gpt-5-nano",
       "gemini-2.5-flash",
       "deepseek-v4-pro"
     ],
     "summarize": [
       "gemini-2.5-flash-lite",
       "glm-4.5-air",
-      "deepseek-v4-flash"
+      "deepseek-v4-flash",
+      "gpt-5-nano"
     ],
     "extract": [
       "gemini-2.5-flash-lite",
       "deepseek-v4-flash",
-      "glm-4.5-air"
+      "glm-4.5-air",
+      "gpt-5-nano"
     ],
     "draft": [
       "deepseek-v4-flash",
-      "glm-4.5-air"
+      "glm-4.5-air",
+      "gpt-5-nano"
     ],
     "reason": [
       "deepseek-v4-pro",
+      "gpt-5-mini",
       "grok-4.3",
       "glm-5"
     ],
@@ -269,6 +309,7 @@
     ],
     "cheap": [
       "deepseek-v4-flash",
+      "gpt-5-nano",
       "gemini-2.5-flash-lite",
       "glm-4.5-air"
     ],

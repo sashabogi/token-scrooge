@@ -166,7 +166,9 @@ def cmd_call(reg, args):
     if provider == "openrouter":
         payload["model"] = model if "/" in model else model
     if args.max_tokens:
-        payload["max_tokens"] = args.max_tokens
+        # Some models (OpenAI GPT-5 / reasoning class) reject "max_tokens" and
+        # require "max_completion_tokens" — overridable per-model in the registry.
+        payload[mcfg.get("token_param", "max_tokens")] = args.max_tokens
     if args.json:
         payload["response_format"] = {"type": "json_object"}
         if not args.system:
