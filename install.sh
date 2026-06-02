@@ -29,8 +29,29 @@ for b in scrooge scrooge-diverge scrooge-verify scrooge-drift; do
   chmod +x "$SRC/bin/$b"
   ln -sf "$SRC/bin/$b" "$BIN_DIR/$b"   # symlink → `git pull` keeps tools current
 done
-cp "$SRC/registry.template.json" "$SCROOGE_HOME/registry.template.json"
-[ -f "$SCROOGE_HOME/registry.json" ] || cp "$SRC/registry.template.json" "$SCROOGE_HOME/registry.json"
+# --- registry: refresh untouched copies, never clobber local edits ----------
+# We keep the last-shipped template at $SCROOGE_HOME/registry.template.json as a
+# baseline. If your live registry.json is byte-identical to that baseline you
+# never edited it, so it's safe to roll forward to the new template. If it
+# differs, you (or a manual sync) changed it — we preserve it and just flag that
+# a newer template exists.
+NEW_TPL="$SRC/registry.template.json"
+OLD_TPL="$SCROOGE_HOME/registry.template.json"
+REG="$SCROOGE_HOME/registry.json"
+if [ ! -f "$REG" ]; then
+  cp "$NEW_TPL" "$REG"                                   # fresh install
+  say "✓ Registry installed."
+elif cmp -s "$REG" "$NEW_TPL"; then
+  : # already current — nothing to do
+elif [ -f "$OLD_TPL" ] && cmp -s "$REG" "$OLD_TPL"; then
+  cp "$NEW_TPL" "$REG"                                   # untouched copy → roll forward
+  say "✓ Registry auto-refreshed to the latest models (no local edits detected)."
+else
+  say "⚠ A newer registry template is available, but your registry.json has local"
+  say "  edits — leaving it untouched. Compare with:"
+  say "      diff \"$REG\" \"$NEW_TPL\"     (or run: scrooge-drift)"
+fi
+cp "$NEW_TPL" "$OLD_TPL"                                 # update baseline for next run
 
 say "✓ Installed: scrooge, scrooge-diverge, scrooge-verify, scrooge-drift → $BIN_DIR"
 
