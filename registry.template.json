@@ -1,5 +1,5 @@
 {
-  "_comment": "Native multi-LLM harness registry. Costs are USD per 1,000,000 tokens (in/out). Edit freely. Opus 4.8 reference: ~15/75 per 1M. Trust is execution-only \u2014 NONE of these are for orchestration or whole-project context.",
+  "_comment": "Native multi-LLM harness registry. Costs are USD per 1,000,000 tokens (in/out). Edit freely. Opus 4.8 reference: ~15/75 per 1M. Trust is execution-only — NONE of these are for orchestration or whole-project context. Pricing last verified from official provider pages 2026-06-01; run `scrooge-drift` to detect when model ids drift.",
   "version": 1,
   "providers": {
     "deepseek": {
@@ -59,79 +59,56 @@
     }
   },
   "models": {
-    "deepseek-chat": {
+    "deepseek-v4-flash": {
       "provider": "deepseek",
-      "cost_in": 0.27,
-      "cost_out": 1.1,
-      "context": 64000,
+      "cost_in": 0.14,
+      "cost_out": 0.28,
+      "context": 1000000,
       "speed": "fast",
       "trust": "execution",
       "good_for": [
         "code",
         "verify",
-        "summarize",
         "extract",
-        "draft"
+        "draft",
+        "summarize",
+        "cheap"
       ]
     },
-    "deepseek-reasoner": {
+    "deepseek-v4-pro": {
       "provider": "deepseek",
-      "cost_in": 0.55,
-      "cost_out": 2.19,
-      "context": 64000,
+      "cost_in": 0.435,
+      "cost_out": 0.87,
+      "context": 1000000,
       "speed": "slow",
       "trust": "execution",
       "good_for": [
         "reason",
         "verify",
-        "analyze"
+        "analyze",
+        "code"
       ]
     },
     "kimi-k2.6": {
       "provider": "kimi",
-      "cost_in": 0.6,
-      "cost_out": 2.5,
-      "context": 256000,
+      "cost_in": 0.95,
+      "cost_out": 4.0,
+      "context": 262144,
       "speed": "medium",
       "trust": "execution",
       "good_for": [
         "code",
-        "verify",
         "long-context",
-        "reason"
+        "reason",
+        "verify"
       ],
       "force_temperature": 1
-    },
-    "moonshot-v1-32k": {
-      "provider": "kimi",
-      "cost_in": 1.0,
-      "cost_out": 3.0,
-      "context": 32000,
-      "speed": "medium",
-      "trust": "execution",
-      "good_for": [
-        "summarize",
-        "extract"
-      ]
-    },
-    "glm-4.6": {
-      "provider": "zai",
-      "cost_in": 0.6,
-      "cost_out": 2.2,
-      "context": 200000,
-      "speed": "medium",
-      "trust": "execution",
-      "good_for": [
-        "code",
-        "verify",
-        "reason"
-      ]
     },
     "glm-4.5-air": {
       "provider": "zai",
       "cost_in": 0.2,
       "cost_out": 1.1,
-      "context": 128000,
+      "context": 131072,
       "speed": "fast",
       "trust": "execution",
       "good_for": [
@@ -141,10 +118,52 @@
         "cheap"
       ]
     },
+    "glm-4.7": {
+      "provider": "zai",
+      "cost_in": 0.6,
+      "cost_out": 2.2,
+      "context": 203000,
+      "speed": "medium",
+      "trust": "execution",
+      "good_for": [
+        "code",
+        "verify",
+        "reason"
+      ]
+    },
+    "glm-5": {
+      "provider": "zai",
+      "cost_in": 1.0,
+      "cost_out": 3.2,
+      "context": 203000,
+      "speed": "medium",
+      "trust": "execution",
+      "good_for": [
+        "code",
+        "reason",
+        "verify",
+        "analyze"
+      ]
+    },
+    "gemini-2.5-flash-lite": {
+      "provider": "gemini",
+      "cost_in": 0.1,
+      "cost_out": 0.4,
+      "context": 1048576,
+      "speed": "fast",
+      "trust": "execution",
+      "good_for": [
+        "cheap",
+        "extract",
+        "draft",
+        "summarize",
+        "vision"
+      ]
+    },
     "gemini-2.5-flash": {
       "provider": "gemini",
-      "cost_in": 0.15,
-      "cost_out": 0.6,
+      "cost_in": 0.3,
+      "cost_out": 2.5,
       "context": 1048576,
       "speed": "fast",
       "trust": "execution",
@@ -154,6 +173,21 @@
         "long-context",
         "verify",
         "vision"
+      ]
+    },
+    "gemini-3-flash-preview": {
+      "provider": "gemini",
+      "cost_in": 0.5,
+      "cost_out": 3.0,
+      "context": 1048576,
+      "speed": "fast",
+      "trust": "execution",
+      "good_for": [
+        "summarize",
+        "extract",
+        "long-context",
+        "vision",
+        "verify"
       ]
     },
     "gpt-4.1-mini": {
@@ -170,94 +204,78 @@
         "extract"
       ]
     },
-    "grok-3-mini": {
+    "grok-4.3": {
       "provider": "xai",
-      "cost_in": 0.3,
-      "cost_out": 0.5,
-      "context": 131072,
-      "speed": "fast",
+      "cost_in": 1.25,
+      "cost_out": 2.5,
+      "context": 1000000,
+      "speed": "medium",
       "trust": "execution",
       "good_for": [
         "reason",
         "verify",
         "analyze"
       ]
-    },
-    "gemini-3.5-flash": {
-      "provider": "gemini",
-      "cost_in": 0.15,
-      "cost_out": 0.6,
-      "context": 1048576,
-      "speed": "fast",
-      "trust": "execution",
-      "good_for": [
-        "summarize",
-        "extract",
-        "long-context",
-        "verify"
-      ]
-    },
-    "gemini-2.5-flash-lite": {
-      "provider": "gemini",
-      "cost_in": 0.1,
-      "cost_out": 0.4,
-      "context": 1048576,
-      "speed": "fast",
-      "trust": "execution",
-      "good_for": [
-        "cheap",
-        "extract",
-        "draft",
-        "summarize"
-      ]
     }
   },
   "aliases": {
-    "deepseek": "deepseek-chat",
-    "reasoner": "deepseek-reasoner",
+    "deepseek": "deepseek-v4-flash",
+    "deepseek-pro": "deepseek-v4-pro",
+    "reasoner": "deepseek-v4-pro",
     "kimi": "kimi-k2.6",
-    "glm": "glm-4.6",
+    "glm": "glm-4.7",
+    "glm5": "glm-5",
     "gemini": "gemini-2.5-flash",
-    "flash": "gemini-3.5-flash",
-    "cheap": "glm-4.5-air",
-    "grok": "grok-3-mini",
-    "lite": "gemini-2.5-flash-lite"
+    "flash": "gemini-3-flash-preview",
+    "lite": "gemini-2.5-flash-lite",
+    "cheap": "deepseek-v4-flash",
+    "grok": "grok-4.3"
   },
   "tasks": {
     "code-review": [
-      "deepseek-chat",
-      "glm-4.6",
+      "deepseek-v4-flash",
+      "glm-4.7",
+      "glm-5",
       "kimi-k2.6"
     ],
     "verify": [
-      "deepseek-chat",
-      "kimi-k2.6"
+      "deepseek-v4-flash",
+      "gemini-2.5-flash",
+      "deepseek-v4-pro"
     ],
     "summarize": [
-      "gemini-2.5-flash",
+      "gemini-2.5-flash-lite",
       "glm-4.5-air",
-      "deepseek-chat"
+      "deepseek-v4-flash"
     ],
     "extract": [
-      "gemini-2.5-flash",
+      "gemini-2.5-flash-lite",
+      "deepseek-v4-flash",
       "glm-4.5-air"
     ],
     "draft": [
-      "deepseek-chat",
+      "deepseek-v4-flash",
       "glm-4.5-air"
     ],
     "reason": [
-      "deepseek-reasoner",
-      "grok-3-mini",
-      "glm-4.6"
+      "deepseek-v4-pro",
+      "grok-4.3",
+      "glm-5"
     ],
     "long-context": [
       "gemini-2.5-flash",
-      "glm-4.6"
+      "deepseek-v4-flash",
+      "kimi-k2.6"
     ],
     "cheap": [
-      "glm-4.5-air",
-      "gemini-2.5-flash-lite"
+      "deepseek-v4-flash",
+      "gemini-2.5-flash-lite",
+      "glm-4.5-air"
+    ],
+    "vision": [
+      "gemini-2.5-flash-lite",
+      "gemini-2.5-flash",
+      "gemini-3-flash-preview"
     ]
   }
 }

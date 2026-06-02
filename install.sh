@@ -25,14 +25,14 @@ fi
 
 # --- install -------------------------------------------------------------
 mkdir -p "$BIN_DIR" "$SCROOGE_HOME"
-for b in scrooge scrooge-diverge scrooge-verify; do
+for b in scrooge scrooge-diverge scrooge-verify scrooge-drift; do
   chmod +x "$SRC/bin/$b"
   ln -sf "$SRC/bin/$b" "$BIN_DIR/$b"   # symlink → `git pull` keeps tools current
 done
 cp "$SRC/registry.template.json" "$SCROOGE_HOME/registry.template.json"
 [ -f "$SCROOGE_HOME/registry.json" ] || cp "$SRC/registry.template.json" "$SCROOGE_HOME/registry.json"
 
-say "✓ Installed: scrooge, scrooge-diverge, scrooge-verify → $BIN_DIR"
+say "✓ Installed: scrooge, scrooge-diverge, scrooge-verify, scrooge-drift → $BIN_DIR"
 
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
