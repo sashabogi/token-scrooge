@@ -266,6 +266,13 @@
     "grok": "grok-4.3"
   },
   "tasks": {
+    "code": [
+      "deepseek-v4-flash",
+      "deepseek-v4-pro",
+      "gpt-5-mini",
+      "glm-4.7",
+      "kimi-k2.6"
+    ],
     "code-review": [
       "deepseek-v4-flash",
       "gpt-5-mini",

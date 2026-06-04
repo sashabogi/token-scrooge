@@ -52,12 +52,14 @@ Every call prints a loud banner, so an external model never runs silently:
 | **`scrooge-diverge`** | "Diverge → focus" idea generator. Fans N isolated cognitive frames across *different* cheap model families in parallel (no shared context = no anchoring), then a critic clusters and flags seductive-but-broken ideas. Great for design/naming/architecture calls. *(Inspired by [claude-adhd](https://github.com/UditAkhourii/adhd).)* |
 | **`scrooge-verify`** | A real verification gate. Detects your toolchain, runs build/typecheck/test (free, ground truth — a non-zero exit is an objective FAIL), then asks a cheap model whether the evidence actually supports a `--claim` (catching "green tests that don't exercise the change"). |
 | **`scrooge-drift`** | Keeps the registry honest. Diffs each provider's *live* model list against what the registry routes to: **DEAD** = registry points at a retired model (calls will fail — fix now), **NEW** = a current-gen model you haven't adopted yet. Exit 1 on drift; run it weekly via cron so the registry never silently rots. |
+| **`scrooge learn` / `lessons` / `forget`** | **Live training.** Accumulates short, per-model corrective guardrails learned from observed failures and auto-injects the relevant ones into the model's system prompt at routing time — so recurring cheap-model bugs are preempted, not re-fixed (and re-paid for) on every call. See [Live training](#live-training-per-model-lessons) below. |
 | **Claude Code gate** *(opt-in)* | A `diverge` skill, an `adversarial-verifier` agent, and a `Stop`/`SubagentStop` hook that **blocks "done" claims with no build/test evidence**. Offered during `scrooge setup`. |
 
 ## How it works
 
 - **One OpenAI-compatible code path** covers every provider; the router is dependency-free Python (stdlib only).
 - **A capability registry** (`~/.token-scrooge/registry.json`) maps each model → provider, env var, base URL, **cost per 1M tokens**, speed, and `good_for` tags. Fully editable; `scrooge models <provider>` discovers live IDs, and `scrooge-drift` flags when the registry has fallen behind what providers actually serve (retired IDs that would fail, or newer models worth adopting) — run it weekly via cron so routing never silently rots.
+- **No hardcoded default model.** A bare `scrooge "prompt"` (no `--model`/`--task`) routes to the **cheapest model you currently have a key for**, verified against the provider's *live* `/models` list (cached ~10 min in `models-cache.json`). If the registry's id has drifted out of what the provider actually serves, Scrooge falls back to a live-discovered id rather than failing on a stale string; `--latest` forces a fresh liveness check. So the default tracks reality as models come and go — nothing to pin or update by hand.
 - **A cost ledger** (`~/.token-scrooge/calls.jsonl`) records every call; `scrooge ledger` totals spend and savings against *your* orchestrator's price.
 - **Bring your own keys.** Nothing is bundled. Works with whatever subset you have — even one provider.
 
@@ -69,6 +71,60 @@ Budget (cheap enough to orchestrate on): DeepSeek V4 · Kimi K2 · Qwen Max · Z
 ### Optional: route through a proxy
 
 Running an OpenAI-compatible LLM proxy (LiteLLM, or a cheap-routing gateway)? Point a provider's `base_url` at it in `registry.json` and set its key — Token Scrooge routes through it transparently. `SCROOGE_ENV_FILE=/path/to/.env` loads keys from an existing proxy env file.
+
+## Live training (per-model lessons)
+
+Cheap models tend to make the *same classes* of mistake over and over — and if your
+orchestrator fixes each one by hand, you pay frontier tokens to re-discover a known bug.
+**Live training** preempts that. Scrooge accumulates short, per-model (and per-task)
+**lessons** — one-line corrective guardrails learned from observed failures — and
+**auto-injects the relevant ones into the model's system prompt at routing time**. This is
+"training" by prompt augmentation: cheap, immediate, and fully transparent (the guardrails
+are visible in the call, not baked into opaque weights).
+
+```bash
+# capture a lesson the moment you fix a recurring bug (the "training signal")
+scrooge learn -m deepseek -t code "Sort bids/asks explicitly; never assume API ordering."
+scrooge learn -m deepseek "Return only what was asked — no prose preamble."   # -t omitted ⇒ all tasks ("*")
+
+scrooge lessons                      # show the whole store
+scrooge lessons -m deepseek -t code  # filtered (also shows the universal "*" lessons that apply)
+
+scrooge forget -m deepseek -t code 0 # remove one by its 0-based index (from `scrooge lessons`)
+scrooge forget -m deepseek --all     # wipe every lesson for a model
+```
+
+**Injection.** On each routed call, Scrooge gathers the lessons for the resolved model
+(its full id **and** any alias), for the active `--task` **and** the `"*"` (all-tasks)
+bucket, plus a top-level `"*"` model bucket of universal guardrails. It composes them into
+a terse block:
+
+```
+Known pitfalls to avoid:
+- Never assume API array ordering — sort order-book bids/asks explicitly by price.
+- Use 0.0 (or the schema default) for absent numeric values, not None.
+```
+
+…and prepends it to the system prompt (if you passed `--system`, *your* text leads and the
+guardrails follow). The transparency banner reports it:
+
+```
+🪙 scrooge ▸ deepseek/deepseek-v4-flash [task: code] +3 lessons
+```
+
+- **Bounded.** ≤ 8 lessons per (model, task) and a total injected-char cap (~1200) — lessons
+  are one-liners, so prompt bloat never erodes the savings Scrooge exists for.
+- **`--no-lessons`** bypasses injection entirely (handy for A/B comparison).
+- **Per-model, not global** — a weakness of one cheap model isn't forced onto the others.
+  (The top-level `"*"` bucket only ever reaches cheap *execution* models, since that's all
+  Scrooge routes.)
+
+**User-local, with a shipped seed.** Your lessons live in `~/.token-scrooge/lessons.json`
+(honoring `$SCROOGE_HOME`) — **gitignored, never committed**. The repo ships a small vetted
+starter set in **`lessons.seed.json`** (committed); it's copied into your store on first use,
+and `scrooge learn --seed` re-merges any new seed lessons without clobbering your edits. A
+missing or malformed store is treated as empty — Scrooge never crashes on it, it just injects
+nothing.
 
 ## Why it's good for AI-coding developers
 

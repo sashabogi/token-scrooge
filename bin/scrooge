@@ -11,7 +11,8 @@ TRANSPARENCY (the whole point): every call prints a loud banner to STDERR and
 appends to a cost ledger. The model's text goes to STDOUT only.
 
 Usage:
-  scrooge "prompt"                          # default model
+  scrooge "prompt"                          # default = cheapest live model (nothing hardcoded)
+  scrooge --latest "prompt"                 # re-check the provider's live model list now
   scrooge --model kimi "prompt"             # force a model (alias or full id)
   scrooge --task code-review "prompt"       # pick cheapest capable model for a task
   scrooge --json --system "..." "prompt"    # JSON-object output + system prompt
@@ -20,7 +21,16 @@ Usage:
   scrooge list                              # show registry (providers/models/tasks)
   scrooge ledger [--since 24h|7d|all]       # usage + cost totals, savings vs Opus
 
+Live training (per-model lessons): short corrective guardrails, learned from
+observed failures, are auto-injected into the model's system prompt at routing
+time (the banner shows "+N lessons"; --no-lessons bypasses):
+  scrooge learn  -m <model> [-t <task>] "lesson"   # capture (dedup; -t omitted => "*")
+  scrooge learn  --seed                              # merge the shipped seed set
+  scrooge lessons [-m <model>] [-t <task>]          # show the store
+  scrooge forget -m <model> [-t <task>] <index>|--all   # remove
+
 Config:  $SCROOGE_HOME (default ~/.token-scrooge) holds registry.json + calls.jsonl
+         + lessons.json (user-local; seeded from the committed lessons.seed.json)
 Keys:    read from the environment; optionally also from $SCROOGE_ENV_FILE (KEY=VALUE)
 Exit: 0 ok, non-zero on error (message to stderr).
 """
@@ -30,6 +40,7 @@ HOME = os.path.expanduser("~")
 SCROOGE_DIR = os.environ.get("SCROOGE_HOME", os.path.join(HOME, ".token-scrooge"))
 REGISTRY = os.path.join(SCROOGE_DIR, "registry.json")
 LEDGER = os.path.join(SCROOGE_DIR, "calls.jsonl")
+MODELS_CACHE = os.path.join(SCROOGE_DIR, "models-cache.json")   # short-lived /models snapshots per provider
 ENV_FALLBACK = os.environ.get("SCROOGE_ENV_FILE", "")   # optional extra KEY=VALUE file (e.g. a proxy .env)
 OPUS_IN, OPUS_OUT = 15.0, 75.0   # $/1M reference for savings math (Opus 4.x)
 
@@ -82,7 +93,7 @@ def provider_key(reg, provider):
     return None
 
 # ---- model resolution ---------------------------------------------------
-def resolve_model(reg, model=None, task=None):
+def resolve_model(reg, model=None, task=None, latest=False):
     """Return (model_id, provider) or raise."""
     if model:
         model = reg.get("aliases", {}).get(model, model)
@@ -103,8 +114,8 @@ def resolve_model(reg, model=None, task=None):
             if provider_key(reg, prov):
                 return mid, prov
         raise SystemExit("No live API key for any model serving task '%s'." % task)
-    # default
-    return resolve_model(reg, model="deepseek-chat")
+    # No model, no task: derive the default dynamically from what's actually live.
+    return default_model(reg, latest=latest)
 
 # ---- HTTP ---------------------------------------------------------------
 def http_post(url, headers, payload, timeout=120):
@@ -117,6 +128,74 @@ def http_get(url, headers, timeout=30):
     req = urllib.request.Request(url, headers=headers, method="GET")
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode())
+
+def list_live_models(reg, provider, ttl=600):
+    """The model ids a provider actually serves *right now*, via its OpenAI-compatible
+    /models endpoint. Cached per provider in MODELS_CACHE for `ttl` seconds so routing
+    never hardcodes a model id yet stays fast. Returns [] (best-effort) on any failure
+    — callers must tolerate an empty list (offline, no key, rate-limited)."""
+    cache = {}
+    try:
+        with open(MODELS_CACHE) as fh:
+            cache = json.load(fh)
+        if not isinstance(cache, dict):
+            cache = {}
+    except Exception:
+        cache = {}
+    ent = cache.get(provider)
+    if ttl and isinstance(ent, dict) and isinstance(ent.get("ids"), list) \
+            and (time.time() - ent.get("ts", 0)) < ttl:
+        return ent["ids"]
+    key = provider_key(reg, provider)
+    if not key:
+        return []
+    base = reg["providers"][provider]["base_url"].rstrip("/")
+    headers = {"Authorization": "Bearer " + key}
+    headers.update(reg["providers"][provider].get("extra_headers", {}))
+    try:
+        data = http_get(base + "/models", headers, timeout=15)
+        ids = sorted(str(m.get("id")) for m in (data.get("data") or []) if m.get("id"))
+    except Exception:
+        return []
+    cache[provider] = {"ts": int(time.time()), "ids": ids}
+    try:
+        os.makedirs(SCROOGE_DIR, exist_ok=True)
+        with open(MODELS_CACHE, "w") as fh:
+            json.dump(cache, fh)
+    except Exception:
+        pass
+    return ids
+
+def default_model(reg, latest=False):
+    """Pick the default model dynamically — NOTHING is hardcoded. Among the registry's
+    models whose provider currently has a key, choose the cheapest one the provider is
+    actually serving live (verified against /models). If every priced candidate has
+    drifted out of the live list, fall back to a live-discovered id (pricing unknown).
+    `latest=True` bypasses the cache to force a fresh liveness check."""
+    priced = sorted(
+        ((mid, cfg["provider"], cfg.get("cost_in", 0) + cfg.get("cost_out", 0))
+         for mid, cfg in reg["models"].items() if provider_key(reg, cfg["provider"])),
+        key=lambda x: x[2])
+    if not priced:
+        raise SystemExit("No default model available — no API key is set for any provider. "
+                         "Run `scrooge setup` (or set a provider key), then `scrooge list`.")
+    ttl = 0 if latest else 600
+    live_by_provider = {}
+    for mid, prov, _ in priced:
+        if prov not in live_by_provider:
+            live_by_provider[prov] = set(list_live_models(reg, prov, ttl=ttl))
+        live = live_by_provider[prov]
+        # Empty set ⇒ couldn't reach the API (offline/etc.): trust the registry rather than block.
+        if not live or mid in live:
+            return mid, prov
+    # Every priced candidate has drifted vs the live list — route to a real live id.
+    prov = priced[0][1]
+    live = sorted(live_by_provider.get(prov) or [])
+    if live:
+        err(DIM("[scrooge] registry models for %s look stale; routing to live '%s' "
+                "(pricing unknown — run scrooge-drift)" % (prov, live[0])))
+        return live[0], prov
+    return priced[0][0], priced[0][1]
 
 # ---- ledger -------------------------------------------------------------
 def append_ledger(entry):
@@ -136,9 +215,132 @@ def cost_usd(reg, model, tin, tout):
         return 0.0
     return (tin / 1e6) * m.get("cost_in", 0) + (tout / 1e6) * m.get("cost_out", 0)
 
+# ---- live training: per-model lessons -----------------------------------
+# A user-local, mutable store of short corrective guardrails learned from
+# observed cheap-model failures. The relevant lessons are auto-injected into a
+# model's system prompt at routing time so recurring bugs are preempted. The
+# store is SEPARATE from the capability/pricing registry. Shape:
+#   { "<model-id-or-alias>": { "<task>"|"*": ["one-liner", ...] }, "*": {...} }
+# Keys starting with "_" are metadata (comments) and ignored.
+LESSONS = os.path.join(SCROOGE_DIR, "lessons.json")
+LESSON_CAP = 8          # max lessons taken per (model, task) bucket
+LESSON_CHAR_CAP = 1200  # total injected-char ceiling for the guardrail block
+
+def _is_meta_key(k):
+    return isinstance(k, str) and k.startswith("_")
+
+def load_lessons():
+    """Read the user-local lessons store. Missing/malformed -> empty dict."""
+    try:
+        with open(LESSONS) as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+def save_lessons(store):
+    os.makedirs(SCROOGE_DIR, exist_ok=True)
+    with open(LESSONS, "w") as fh:
+        json.dump(store, fh, indent=2)
+        fh.write("\n")
+
+def _seed_path():
+    """Locate the committed seed set (SCROOGE_HOME first, then alongside the repo)."""
+    here = os.path.dirname(os.path.realpath(__file__))   # resolves symlinks → repo/bin
+    for cand in (os.path.join(SCROOGE_DIR, "lessons.seed.json"),
+                 os.path.join(here, "..", "lessons.seed.json")):
+        if os.path.exists(cand):
+            return cand
+    return None
+
+def load_seed():
+    p = _seed_path()
+    if not p:
+        return {}
+    try:
+        with open(p) as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+def merge_seed(store):
+    """Add seed lessons not already present (dedup on exact text). Returns count added."""
+    added = 0
+    for model, tasks in load_seed().items():
+        if _is_meta_key(model) or not isinstance(tasks, dict):
+            continue
+        for task, lessons in tasks.items():
+            if _is_meta_key(task) or not isinstance(lessons, list):
+                continue
+            bucket = store.setdefault(model, {}).setdefault(task, [])
+            for L in lessons:
+                if L not in bucket:
+                    bucket.append(L); added += 1
+    return added
+
+def seed_lessons_if_absent():
+    """First-use bootstrap: if no user store exists yet, copy the shipped seed in."""
+    if os.path.exists(LESSONS):
+        return
+    seed = load_seed()
+    if seed:
+        save_lessons(seed)
+
+def aliases_for(reg, model):
+    """All alias names that resolve to this full model id."""
+    return [a for a, full in reg.get("aliases", {}).items() if full == model]
+
+def gather_lessons(reg, model, task):
+    """Ordered, de-duplicated lessons for (full id + aliases) × (task + '*'),
+    then the top-level universal '*' model bucket. <=LESSON_CAP per bucket."""
+    store = load_lessons()
+    if not store:
+        return []
+    model_keys = [model] + [a for a in aliases_for(reg, model) if a != model]
+    task_keys = ([task] if task else []) + ["*"]
+    out, seen = [], set()
+
+    def drain(mkey):
+        mbucket = store.get(mkey)
+        if not isinstance(mbucket, dict):
+            return
+        for tkey in task_keys:
+            lst = mbucket.get(tkey)
+            if not isinstance(lst, list):
+                continue
+            taken = 0
+            for L in lst:
+                if taken >= LESSON_CAP:
+                    break
+                if L not in seen:
+                    seen.add(L); out.append(L)
+                taken += 1
+
+    for mkey in model_keys:
+        drain(mkey)
+    drain("*")   # universal lessons (apply to every routed cheap model)
+    return out
+
+def build_lessons_block(reg, model, task):
+    """Compose the terse guardrail block and its lesson count, within the char cap."""
+    lessons = gather_lessons(reg, model, task)
+    if not lessons:
+        return "", 0
+    header = "Known pitfalls to avoid:"
+    lines, used, n = [header], len(header), 0
+    for L in lessons:
+        line = "- " + L
+        if used + 1 + len(line) > LESSON_CHAR_CAP:
+            break
+        lines.append(line); used += 1 + len(line); n += 1
+    if not n:
+        return "", 0
+    return "\n".join(lines), n
+
 # ---- commands -----------------------------------------------------------
 def cmd_call(reg, args):
-    model, provider = resolve_model(reg, args.model, args.task)
+    model, provider = resolve_model(reg, args.model, args.task, latest=getattr(args, "latest", False))
     key = provider_key(reg, provider)
     if not key:
         raise SystemExit("No API key set for provider '%s' (env: %s)" %
@@ -154,9 +356,24 @@ def cmd_call(reg, args):
     headers = {"Authorization": "Bearer " + key, "Content-Type": "application/json"}
     headers.update(reg["providers"][provider].get("extra_headers", {}))
 
-    msgs = []
+    # Live training: gather per-model lessons and fold them into the system prompt.
+    lessons_block, n_lessons = ("", 0)
+    if not args.no_lessons:
+        seed_lessons_if_absent()
+        lessons_block, n_lessons = build_lessons_block(reg, model, args.task)
+
+    # Compose the system message: user's --system (or the JSON-mode instruction)
+    # leads; injected guardrails follow.
+    sys_parts = []
     if args.system:
-        msgs.append({"role": "system", "content": args.system})
+        sys_parts.append(args.system)
+    elif args.json:
+        sys_parts.append("Respond ONLY with a single valid JSON object. No prose, no code fences.")
+    if lessons_block:
+        sys_parts.append(lessons_block)
+    msgs = []
+    if sys_parts:
+        msgs.append({"role": "system", "content": "\n\n".join(sys_parts)})
     msgs.append({"role": "user", "content": prompt})
     # Per-model constraint: some models (e.g. kimi-k2.6) require a fixed temperature.
     mcfg = reg["models"].get(model, {})
@@ -171,11 +388,11 @@ def cmd_call(reg, args):
         payload[mcfg.get("token_param", "max_tokens")] = args.max_tokens
     if args.json:
         payload["response_format"] = {"type": "json_object"}
-        if not args.system:
-            msgs.insert(0, {"role": "system", "content": "Respond ONLY with a single valid JSON object. No prose, no code fences."})
+        # (the "JSON object only" system instruction is composed above)
 
     label = ("[task: %s]" % args.task) if args.task else ""
-    err(ORANGE("🪙 scrooge ▸ %s/%s %s" % (provider, model, label)))
+    extra = (" +%d lessons" % n_lessons) if n_lessons else ""
+    err(ORANGE("🪙 scrooge ▸ %s/%s %s%s" % (provider, model, label, extra)))
 
     t0 = time.time()
     try:
@@ -213,14 +430,9 @@ def cmd_models(reg, args):
     provider = args.provider
     if provider not in reg["providers"]:
         raise SystemExit("Unknown provider. Known: %s" % ", ".join(reg["providers"]))
-    key = provider_key(reg, provider)
-    if not key:
+    if not provider_key(reg, provider):
         raise SystemExit("No key for %s" % provider)
-    base = reg["providers"][provider]["base_url"].rstrip("/")
-    headers = {"Authorization": "Bearer " + key}
-    headers.update(reg["providers"][provider].get("extra_headers", {}))
-    data = http_get(base + "/models", headers)
-    ids = sorted(m.get("id", "?") for m in (data.get("data") or []))
+    ids = list_live_models(reg, provider, ttl=0)   # always show a fresh list here
     err(DIM("[scrooge] %d models from %s:" % (len(ids), provider)))
     for i in ids:
         print(i)
@@ -287,6 +499,117 @@ def cmd_ledger(reg, args):
     print("\n  by model:")
     for k, d in sorted(by.items(), key=lambda x: -x[1]["cost"]):
         print("    %-28s %3d calls  $%.4f  (%s→%s tok)" % (k, d["n"], d["cost"], f"{d['tin']:,}", f"{d['tout']:,}"))
+
+# ---- live-training subcommands (learn / lessons / forget) ---------------
+def cmd_learn(reg, args):
+    """Append a lesson (dedup exact). --seed merges the shipped seed set."""
+    if args.seed:
+        store = load_lessons()
+        added = merge_seed(store)
+        save_lessons(store)
+        print("%s merged %d seed lesson(s) into %s" %
+              (OKc("✓"), added, LESSONS.replace(HOME, "~")))
+        return
+    if not args.model:
+        raise SystemExit("learn: -m/--model is required (or use --seed to load the shipped seed set).")
+    if not args.text or not args.text.strip():
+        raise SystemExit('learn: provide the lesson text, e.g. scrooge learn -m deepseek -t code "Sort explicitly; never assume API ordering."')
+    seed_lessons_if_absent()   # first-use bootstrap, regardless of entry point
+    model = reg.get("aliases", {}).get(args.model, args.model)   # store under canonical full id
+    task = args.task or "*"
+    store = load_lessons()
+    bucket = store.setdefault(model, {}).setdefault(task, [])
+    text = args.text.strip()
+    scope = "%s/%s" % (GOLD(model), task)
+    if text in bucket:
+        print("%s already known for %s" % (GREYc("•"), scope)); return
+    bucket.append(text)
+    save_lessons(store)
+    note = "" if (model in reg["models"] or args.model in reg.get("aliases", {})) \
+           else GREYc("  (note: '%s' isn't a known model/alias — stored anyway)" % model)
+    print("%s learned for %s: %s%s" % (OKc("✓"), scope, text, note))
+
+def _print_model_lessons(model, tasks, tfilter):
+    """Print one model's buckets; returns how many lessons were shown."""
+    shown = 0
+    header_done = False
+    for task in sorted(tasks.keys()):
+        if _is_meta_key(task):
+            continue
+        if tfilter and task != tfilter:
+            continue
+        lessons = tasks.get(task) or []
+        if not isinstance(lessons, list) or not lessons:
+            continue
+        if not header_done:
+            print("\n" + GOLD("● " + model)); header_done = True
+        print("  " + AMBER(task if task != "*" else "* (all tasks)"))
+        for i, L in enumerate(lessons):
+            print("    %s %s" % (GREYc("%d." % i), L)); shown += 1
+    return shown
+
+def cmd_lessons(reg, args):
+    """Pretty-print the lessons store (optionally filtered by -m / -t)."""
+    seed_lessons_if_absent()
+    store = load_lessons()
+    real = {k: v for k, v in store.items() if not _is_meta_key(k)}
+    print(GOLD(BOLD("LESSONS")) + GREYc("  (%s)" % LESSONS.replace(HOME, "~")))
+    if not real:
+        print(GREYc('  none yet — add one:  scrooge learn -m <model> -t <task> "…"')); return
+    mfilter = reg.get("aliases", {}).get(args.model, args.model) if args.model else None
+    shown = 0
+    if mfilter:
+        # the model's own buckets, plus the universal "*" bucket that also applies
+        shown += _print_model_lessons(mfilter, real.get(mfilter, {}), args.task)
+        if "*" in real and mfilter != "*":
+            shown += _print_model_lessons("* (every cheap model)", real.get("*", {}), args.task)
+    else:
+        for model in sorted(real.keys()):
+            shown += _print_model_lessons(model, real.get(model, {}), args.task)
+    if not shown:
+        print(GREYc("  (nothing matches that filter)"))
+
+def cmd_forget(reg, args):
+    """Remove a lesson by 0-based index, or --all for a whole (model[/task]) scope."""
+    if not args.model:
+        raise SystemExit("forget: -m/--model is required.")
+    seed_lessons_if_absent()   # so a fresh store reflects the shipped seed before removal
+    model = reg.get("aliases", {}).get(args.model, args.model)
+    store = load_lessons()
+    tasks = store.get(model)
+    if not isinstance(tasks, dict) or not tasks:
+        raise SystemExit("No lessons stored for model '%s'." % model)
+    if args.all:
+        if args.task:
+            if args.task not in tasks:
+                raise SystemExit("No lessons for %s/%s." % (model, args.task))
+            tasks.pop(args.task, None)
+            scope = "%s/%s" % (model, args.task)
+        else:
+            store.pop(model, None)
+            scope = model
+        if model in store and not store[model]:
+            store.pop(model, None)
+        save_lessons(store)
+        print("%s forgot all lessons for %s" % (OKc("✓"), GOLD(scope)))
+        return
+    task = args.task or "*"
+    bucket = tasks.get(task)
+    if not isinstance(bucket, list) or not bucket:
+        raise SystemExit("No lessons for %s/%s." % (model, task))
+    try:
+        idx = int(args.index)
+    except (TypeError, ValueError):
+        raise SystemExit("forget: give a 0-based <index> (see `scrooge lessons`) or --all.")
+    if idx < 0 or idx >= len(bucket):
+        raise SystemExit("Index %s out of range (0..%d) for %s/%s." % (args.index, len(bucket) - 1, model, task))
+    removed = bucket.pop(idx)
+    if not bucket:
+        tasks.pop(task, None)
+    if not tasks:
+        store.pop(model, None)
+    save_lessons(store)
+    print("%s forgot %s/%s[%d]: %s" % (OKc("✓"), GOLD(model), task, idx, removed))
 
 # ---- pretty UI (stdlib only: truecolor + box-drawing + arrow menu) ------
 def _uitty(): return sys.stdout.isatty() and os.environ.get("TERM", "") not in ("", "dumb") and not os.environ.get("NO_COLOR")
@@ -592,7 +915,7 @@ def main():
     reg = load_registry()
 
     # Manual subcommand dispatch (avoids argparse subparser vs positional-prompt clash).
-    if argv and argv[0] in ("models", "list", "ledger"):
+    if argv and argv[0] in ("models", "list", "ledger", "learn", "lessons", "forget"):
         cmd, rest = argv[0], argv[1:]
         if cmd == "models":
             ap = argparse.ArgumentParser(prog="scrooge models"); ap.add_argument("provider")
@@ -602,6 +925,25 @@ def main():
         if cmd == "ledger":
             ap = argparse.ArgumentParser(prog="scrooge ledger"); ap.add_argument("--since", default="24h")
             return cmd_ledger(reg, ap.parse_args(rest))
+        if cmd == "learn":
+            ap = argparse.ArgumentParser(prog="scrooge learn")
+            ap.add_argument("--model", "-m")
+            ap.add_argument("--task", "-t")
+            ap.add_argument("--seed", action="store_true", help="merge the shipped seed set into your store")
+            ap.add_argument("text", nargs="?")
+            return cmd_learn(reg, ap.parse_args(rest))
+        if cmd == "lessons":
+            ap = argparse.ArgumentParser(prog="scrooge lessons")
+            ap.add_argument("--model", "-m")
+            ap.add_argument("--task", "-t")
+            return cmd_lessons(reg, ap.parse_args(rest))
+        if cmd == "forget":
+            ap = argparse.ArgumentParser(prog="scrooge forget")
+            ap.add_argument("--model", "-m")
+            ap.add_argument("--task", "-t")
+            ap.add_argument("--all", action="store_true")
+            ap.add_argument("index", nargs="?")
+            return cmd_forget(reg, ap.parse_args(rest))
 
     # Default: a model call.
     ap = argparse.ArgumentParser(prog="scrooge")
@@ -612,6 +954,10 @@ def main():
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--max-tokens", type=int, dest="max_tokens")
     ap.add_argument("--temperature", type=float, default=0.3)
+    ap.add_argument("--no-lessons", action="store_true", dest="no_lessons",
+                    help="skip injecting learned per-model lessons (A/B comparison)")
+    ap.add_argument("--latest", action="store_true",
+                    help="for the default model, re-check the provider's live model list now (bypass cache)")
     return cmd_call(reg, ap.parse_args(argv))
 
 if __name__ == "__main__":

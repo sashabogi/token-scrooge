@@ -11,3 +11,7 @@ calls.jsonl
 registry.json
 registry.template.json.bak*
 drift-report.txt
+# live-training store is user-local (seeded from the committed lessons.seed.json)
+lessons.json
+# cached provider /models snapshots (runtime state)
+models-cache.json

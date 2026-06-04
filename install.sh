@@ -53,6 +53,13 @@ else
 fi
 cp "$NEW_TPL" "$OLD_TPL"                                 # update baseline for next run
 
+# --- live-training seed: keep a current copy in $SCROOGE_HOME ----------------
+# The committed seed (lessons.seed.json) ships starter guardrails. The user-local
+# lessons.json (gitignored) is created from it on first use and never clobbered.
+if [ -f "$SRC/lessons.seed.json" ]; then
+  cp "$SRC/lessons.seed.json" "$SCROOGE_HOME/lessons.seed.json"
+fi
+
 say "✓ Installed: scrooge, scrooge-diverge, scrooge-verify, scrooge-drift → $BIN_DIR"
 
 case ":$PATH:" in
