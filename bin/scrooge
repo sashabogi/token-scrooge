@@ -14,7 +14,9 @@ Usage:
   scrooge "prompt"                          # default = cheapest live model (nothing hardcoded)
   scrooge --latest "prompt"                 # re-check the provider's live model list now
   scrooge --model kimi "prompt"             # force a model (alias or full id)
-  scrooge --task code-review "prompt"       # pick cheapest capable model for a task
+  scrooge --task code "prompt"              # weigh capability×cost for the task (best value)
+  scrooge --task code -d hard "prompt"      # difficulty floor → escalate hard work off the cheap model
+  scrooge --task code --spread 3 "prompt"   # fan a batch across the top-3 capable models
   scrooge --json --system "..." "prompt"    # JSON-object output + system prompt
   echo "long input" | scrooge --task summarize   # prompt from stdin (or - )
   scrooge models <provider>                 # list live model ids from a provider
@@ -35,13 +37,14 @@ Config:  $SCROOGE_HOME (default ~/.token-scrooge) holds registry.json + calls.js
 Keys:    read from the environment; optionally also from $SCROOGE_ENV_FILE (KEY=VALUE)
 Exit: 0 ok, non-zero on error (message to stderr).
 """
-import sys, os, json, time, argparse, urllib.request, urllib.error, re, shutil
+import sys, os, json, time, argparse, urllib.request, urllib.error, re, shutil, hashlib
 
 HOME = os.path.expanduser("~")
 SCROOGE_DIR = os.environ.get("SCROOGE_HOME", os.path.join(HOME, ".token-scrooge"))
 REGISTRY = os.path.join(SCROOGE_DIR, "registry.json")
 LEDGER = os.path.join(SCROOGE_DIR, "calls.jsonl")
 MODELS_CACHE = os.path.join(SCROOGE_DIR, "models-cache.json")   # short-lived /models snapshots per provider
+CAPS = os.path.join(SCROOGE_DIR, "capabilities.json")           # per-model quality scores for the weighted router
 ENV_FALLBACK = os.environ.get("SCROOGE_ENV_FILE", "")   # optional extra KEY=VALUE file (e.g. a proxy .env)
 OPUS_IN, OPUS_OUT = 15.0, 75.0   # $/1M reference for savings math (Opus 4.x)
 
@@ -117,6 +120,106 @@ def resolve_model(reg, model=None, task=None, latest=False):
         raise SystemExit("No live API key for any model serving task '%s'." % task)
     # No model, no task: derive the default dynamically from what's actually live.
     return default_model(reg, latest=latest)
+
+# ---- capability-weighted routing ----------------------------------------
+# Pick the best *value* model for a task: weight each candidate's quality-for-the-task
+# against its price, but first gate by a DIFFICULTY floor so hard work escalates off the
+# cheapest model while easy work stays cheap. Quality data lives in capabilities.json
+# (seeded from the committed capabilities.seed.json; refreshed by `scrooge-capabilities`).
+TASK_METRIC = {"code": "coding", "code-review": "coding", "reason": "reasoning",
+               "verify": "reasoning", "math": "math"}   # else -> "intelligence"
+DIFF_PCTL = {"easy": 0.0, "medium": 0.5, "hard": 0.8}    # capability floor = this percentile of candidates
+HARD_TASKS = ("code", "code-review", "reason", "verify")  # default to 'medium' difficulty when unspecified
+
+def _caps_seed_path():
+    here = os.path.dirname(os.path.realpath(__file__))
+    for cand in (os.path.join(SCROOGE_DIR, "capabilities.seed.json"),
+                 os.path.join(here, "..", "capabilities.seed.json")):
+        if os.path.exists(cand):
+            return cand
+    return None
+
+def load_caps():
+    """Per-model quality scores (user store → seed). Missing/malformed → {}."""
+    for path in (CAPS, _caps_seed_path()):
+        if not path:
+            continue
+        try:
+            with open(path) as fh:
+                d = json.load(fh)
+            if isinstance(d, dict):
+                return {k: v for k, v in d.items() if not k.startswith("_")}
+        except Exception:
+            continue
+    return {}
+
+def task_metric(task):
+    return TASK_METRIC.get(task or "", "intelligence")
+
+def infer_difficulty(task, prompt):
+    """Fallback when --difficulty is omitted: harder default for code/reasoning tasks,
+    bumped a notch for very long prompts."""
+    base = "medium" if (task in HARD_TASKS) else "easy"
+    if prompt and len(prompt) > 8000:
+        base = {"easy": "medium", "medium": "hard", "hard": "hard"}[base]
+    return base
+
+def model_quality(caps, mid, metric):
+    c = caps.get(mid) or {}
+    v = c.get(metric)
+    if not isinstance(v, (int, float)):
+        v = c.get("intelligence")          # fall back to the general index
+    return float(v) if isinstance(v, (int, float)) else 0.0
+
+def blended_cost(reg, mid):
+    m = reg["models"].get(mid, {})
+    return max(1e-6, 0.3 * m.get("cost_in", 0) + 0.7 * m.get("cost_out", 0))
+
+def weigh_candidates(reg, caps, cand_ids, task, difficulty):
+    """Apply the difficulty floor, then rank survivors by quality^qw / cost^cw.
+    Returns [(model_id, score)] best-first."""
+    metric = task_metric(task)
+    quals = [(mid, model_quality(caps, mid, metric)) for mid in cand_ids]
+    scored_q = sorted(q for _, q in quals if q > 0)
+    pct = DIFF_PCTL.get(difficulty, 0.5)
+    floor = 0.0
+    if scored_q and pct > 0:
+        floor = scored_q[min(len(scored_q) - 1, int(round(pct * (len(scored_q) - 1))))]
+    survivors = [(mid, q) for mid, q in quals if q >= floor] or quals
+    rw = reg.get("routing") or {}
+    qw, cw = rw.get("q_weight", 1.5), rw.get("c_weight", 0.5)
+    out = [(mid, (max(q, 1e-6) ** qw) / (blended_cost(reg, mid) ** cw)) for mid, q in survivors]
+    out.sort(key=lambda x: -x[1])
+    return out
+
+def _spread_index(prompt, k):
+    """Deterministic, process-independent bucket so a parallel batch fans across the
+    top-k models instead of hammering one (built-in hash() is salted — use sha1)."""
+    h = int(hashlib.sha1((prompt or "").encode("utf-8", "replace")).hexdigest()[:8], 16)
+    return h % k
+
+def route_task(reg, caps, task, difficulty, prompt, spread=0):
+    """Capability-weighted pick for a --task. Returns (model_id, provider, info).
+    Falls back to registry cheapest-first order when no capability data is available."""
+    cands = reg.get("tasks", {}).get(task)
+    if not cands:
+        raise SystemExit("Unknown task '%s'. Tasks: %s" % (task, ", ".join(reg.get("tasks", {}))))
+    live = [m for m in cands if provider_key(reg, reg["models"][m]["provider"])]
+    if not live:
+        raise SystemExit("No live API key for any model serving task '%s'." % task)
+    if not caps:                                   # no quality data → legacy cheapest-first
+        return live[0], reg["models"][live[0]]["provider"], {"difficulty": None, "weighed": False}
+    diff = difficulty or infer_difficulty(task, prompt)
+    scored = weigh_candidates(reg, caps, live, task, diff)
+    ranked = [m for m, _ in scored]
+    if spread and len(ranked) > 1:
+        k = min(spread, len(ranked))
+        mid = ranked[_spread_index(prompt, k)]
+    else:
+        mid = ranked[0]
+    return mid, reg["models"][mid]["provider"], {
+        "difficulty": diff, "weighed": True, "metric": task_metric(task),
+        "considered": len(live), "pool": ranked[:max(spread, 1)] if spread else ranked[:1]}
 
 # ---- HTTP ---------------------------------------------------------------
 def http_post(url, headers, payload, timeout=120):
@@ -359,16 +462,30 @@ def build_lessons_block(reg, model, task):
 
 # ---- commands -----------------------------------------------------------
 def cmd_call(reg, args):
-    model, provider = resolve_model(reg, args.model, args.task, latest=getattr(args, "latest", False))
-    key = provider_key(reg, provider)
-    if not key:
-        raise SystemExit("No API key set for provider '%s' (env: %s)" %
-                         (provider, ", ".join(reg["providers"][provider].get("env", []))))
+    # Read the prompt first — the capability weigher uses it to infer difficulty and to
+    # fan a --spread batch deterministically.
     prompt = args.prompt
     if prompt in (None, "-"):
         prompt = sys.stdin.read()
     if not prompt or not prompt.strip():
         raise SystemExit("Empty prompt.")
+
+    # Route: explicit --model wins; a --task is weighed by capability×cost (gated by
+    # difficulty); otherwise the dynamic cheapest-live default.
+    route_info = {}
+    if args.model:
+        model, provider = resolve_model(reg, model=args.model)
+    elif args.task and not getattr(args, "no_weigh", False):
+        model, provider, route_info = route_task(
+            reg, load_caps(), args.task, getattr(args, "difficulty", None),
+            prompt, spread=getattr(args, "spread", 0) or 0)
+    else:
+        model, provider = resolve_model(reg, args.model, args.task,
+                                        latest=getattr(args, "latest", False))
+    key = provider_key(reg, provider)
+    if not key:
+        raise SystemExit("No API key set for provider '%s' (env: %s)" %
+                         (provider, ", ".join(reg["providers"][provider].get("env", []))))
 
     cwd = os.getcwd()
     proj = project_label(cwd)   # stamped on the ledger so `scrooge watch --here` can filter
@@ -412,7 +529,12 @@ def cmd_call(reg, args):
         payload["response_format"] = {"type": "json_object"}
         # (the "JSON object only" system instruction is composed above)
 
-    label = ("[task: %s]" % args.task) if args.task else ""
+    if args.task and route_info.get("difficulty"):
+        spread_n = len(route_info.get("pool") or [])
+        sp = " · spread/%d" % spread_n if spread_n > 1 else ""
+        label = "[task: %s · %s%s]" % (args.task, route_info["difficulty"], sp)
+    else:
+        label = ("[task: %s]" % args.task) if args.task else ""
     extra = (" +%d lessons" % n_lessons) if n_lessons else ""
     err(ORANGE("🪙 scrooge ▸ %s/%s %s%s" % (provider, model, label, extra)))
 
@@ -473,12 +595,19 @@ def cmd_list(reg, args):
     for p, cfg in reg["providers"].items():
         live = "✓" if provider_key(reg, p) else "✗"
         print("  %s %-11s %s" % (live, p, cfg["base_url"]))
-    print("\nMODELS ($/1M in/out · trust · good_for):")
+    caps = load_caps()
+    cap_hdr = "intel/code/reason · " if caps else ""
+    print("\nMODELS ($/1M in/out · %strust · good_for):" % cap_hdr)
     for m, c in reg["models"].items():
         live = "✓" if provider_key(reg, c["provider"]) else "✗"
-        print("  %s %-24s %5.2f/%-5.2f %-9s %s" % (live, m, c.get("cost_in",0), c.get("cost_out",0),
-              c.get("trust",""), ",".join(c.get("good_for", []))))
-    print("\nTASKS:")
+        cap = ""
+        if caps:
+            q = caps.get(m) or {}
+            fmt = lambda v: ("%2.0f" % v) if isinstance(v, (int, float)) else " -"
+            cap = "%s/%s/%s " % (fmt(q.get("intelligence")), fmt(q.get("coding")), fmt(q.get("reasoning")))
+        print("  %s %-24s %5.2f/%-5.2f %s%-9s %s" % (live, m, c.get("cost_in",0), c.get("cost_out",0),
+              cap, c.get("trust",""), ",".join(c.get("good_for", []))))
+    print("\nTASKS (weighed by capability×cost, gated by difficulty):")
     for t, ms in reg.get("tasks", {}).items():
         print("  %-13s → %s" % (t, ", ".join(ms)))
     print("\nALIASES:", ", ".join("%s=%s" % (k, v) for k, v in reg.get("aliases", {}).items()))
@@ -1122,6 +1251,12 @@ def main():
                     help="skip injecting learned per-model lessons (A/B comparison)")
     ap.add_argument("--latest", action="store_true",
                     help="for the default model, re-check the provider's live model list now (bypass cache)")
+    ap.add_argument("--difficulty", "-d", choices=["easy", "medium", "hard"],
+                    help="task difficulty → sets the capability floor (else inferred)")
+    ap.add_argument("--spread", type=int, default=0, metavar="N",
+                    help="fan a batch across the top-N capable models (rate-limit/throughput)")
+    ap.add_argument("--no-weigh", action="store_true", dest="no_weigh",
+                    help="skip capability weighing; use the registry's cheapest-first task order")
     return cmd_call(reg, ap.parse_args(argv))
 
 if __name__ == "__main__":

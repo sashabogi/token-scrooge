@@ -25,7 +25,7 @@ fi
 
 # --- install -------------------------------------------------------------
 mkdir -p "$BIN_DIR" "$SCROOGE_HOME"
-for b in scrooge scrooge-diverge scrooge-verify scrooge-drift; do
+for b in scrooge scrooge-diverge scrooge-verify scrooge-drift scrooge-capabilities; do
   chmod +x "$SRC/bin/$b"
   ln -sf "$SRC/bin/$b" "$BIN_DIR/$b"   # symlink → `git pull` keeps tools current
 done
@@ -59,8 +59,12 @@ cp "$NEW_TPL" "$OLD_TPL"                                 # update baseline for n
 if [ -f "$SRC/lessons.seed.json" ]; then
   cp "$SRC/lessons.seed.json" "$SCROOGE_HOME/lessons.seed.json"
 fi
+# --- capability seed: quality scores for the weighted router (refreshed by scrooge-capabilities)
+if [ -f "$SRC/capabilities.seed.json" ]; then
+  cp "$SRC/capabilities.seed.json" "$SCROOGE_HOME/capabilities.seed.json"
+fi
 
-say "✓ Installed: scrooge, scrooge-diverge, scrooge-verify, scrooge-drift → $BIN_DIR"
+say "✓ Installed: scrooge, scrooge-diverge, scrooge-verify, scrooge-drift, scrooge-capabilities → $BIN_DIR"
 
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;

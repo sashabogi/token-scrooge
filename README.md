@@ -73,6 +73,7 @@ scrooge watch --here     # only this repo's calls (auto-detected from the git ro
 | **`scrooge-diverge`** | "Diverge → focus" idea generator. Fans N isolated cognitive frames across *different* cheap model families in parallel (no shared context = no anchoring), then a critic clusters and flags seductive-but-broken ideas. Great for design/naming/architecture calls. *(Inspired by [claude-adhd](https://github.com/UditAkhourii/adhd).)* |
 | **`scrooge-verify`** | A real verification gate. Detects your toolchain, runs build/typecheck/test (free, ground truth — a non-zero exit is an objective FAIL), then asks a cheap model whether the evidence actually supports a `--claim` (catching "green tests that don't exercise the change"). |
 | **`scrooge-drift`** | Keeps the registry honest. Diffs each provider's *live* model list against what the registry routes to: **DEAD** = registry points at a retired model (calls will fail — fix now), **NEW** = a current-gen model you haven't adopted yet. Exit 1 on drift; run it weekly via cron so the registry never silently rots. |
+| **`scrooge-capabilities`** | Refreshes per-model **quality scores** (Artificial Analysis Intelligence/Coding/Math indices + GPQA + speed, plus OpenRouter context/modality) into `capabilities.json`, which powers capability-aware routing (below). Run weekly via cron. Needs a free [Artificial Analysis](https://artificialanalysis.ai/) key in `$AA_API_KEY`. |
 | **`scrooge learn` / `lessons` / `forget`** | **Live training.** Accumulates short, per-model corrective guardrails learned from observed failures and auto-injects the relevant ones into the model's system prompt at routing time — so recurring cheap-model bugs are preempted, not re-fixed (and re-paid for) on every call. See [Live training](#live-training-per-model-lessons) below. |
 | **Claude Code gate** *(opt-in)* | A `diverge` skill, an `adversarial-verifier` agent, a `Stop`/`SubagentStop` hook that **blocks "done" claims with no build/test evidence**, and a `PreToolUse` hook (`scrooge-announce.py`) that drops an inline marker whenever the agent delegates to scrooge (nudging you to open `scrooge watch`). Offered during `scrooge setup`. |
 
@@ -92,6 +93,41 @@ Budget (cheap enough to orchestrate on): DeepSeek V4 · Kimi K2 · Qwen Max · Z
 ### Optional: route through a proxy
 
 Running an OpenAI-compatible LLM proxy (LiteLLM, or a cheap-routing gateway)? Point a provider's `base_url` at it in `registry.json` and set its key — Token Scrooge routes through it transparently. `SCROOGE_ENV_FILE=/path/to/.env` loads keys from an existing proxy env file.
+
+## Capability-aware routing (not just cheapest)
+
+A `--task` doesn't just grab the cheapest model — it **weighs each candidate's quality
+*for that task* against its price, gated by difficulty**, so easy work stays cheap and hard
+work escalates to a stronger (but still sub-orchestrator) model instead of always hitting
+the floor.
+
+```bash
+scrooge -t code "draft a getter"              # easy/medium → cheapest capable (e.g. deepseek-v4-flash)
+scrooge -t code -d hard "design a lock-free queue"   # hard → escalates (e.g. deepseek-v4-pro)
+scrooge -t code --spread 3 < batch_of_calls   # fan a swarm across the top-3 capable models (rate limits/throughput)
+scrooge -t code --no-weigh "…"                # opt out → registry cheapest-first order
+```
+
+How it works:
+
+- **Quality data** lives in `~/.token-scrooge/capabilities.json` — per model: `intelligence`,
+  `coding`, `math`, `reasoning` (GPQA), `speed_tps`. Seeded from the committed
+  `capabilities.seed.json` (real [Artificial Analysis](https://artificialanalysis.ai/) numbers) so it works out of the box,
+  and refreshed weekly by **`scrooge-capabilities`** (AA + OpenRouter).
+- **The weigher** maps the task to a metric (`code`→coding, `reason`/`verify`→reasoning, else
+  the general intelligence index), applies a **difficulty floor** (a percentile of the
+  candidate pool: `easy`=none, `medium`≈median, `hard`≈top-fifth), then ranks survivors by
+  `quality^1.5 / cost^0.5`. The banner shows the call: `[task: code · hard]`.
+- **Difficulty** comes from `--difficulty/-d easy|medium|hard`, or is **inferred** when omitted
+  (code/reasoning tasks default to `medium`, long prompts bump a notch).
+- **`--spread N`** distributes a batch deterministically (by prompt hash) across the top-N
+  capable models — no central lock, so parallel workers self-balance.
+- Weights and difficulty floors are tunable under a `"routing"` key in `registry.json`. With no
+  capability data present, routing falls back to the registry's cheapest-first task order.
+
+> Reality check: capability routing won't spread *easy* work across many models — for a uniform
+> easy batch (e.g. classification), one cheap model is genuinely the right answer. The payoff is
+> **escalation** on hard tasks and **throughput** via `--spread`.
 
 ## Live training (per-model lessons)
 

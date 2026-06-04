@@ -15,3 +15,5 @@ drift-report.txt
 lessons.json
 # cached provider /models snapshots (runtime state)
 models-cache.json
+# user-local capability scores (refreshed weekly from capabilities.seed.json + APIs)
+capabilities.json
