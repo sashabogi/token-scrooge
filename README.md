@@ -88,7 +88,7 @@ scrooge watch --here     # only this repo's calls (auto-detected from the git ro
 | **`scrooge-diverge`** | "Diverge → focus" idea generator. Fans N isolated cognitive frames across *different* cheap model families in parallel (no shared context = no anchoring), then a critic clusters and flags seductive-but-broken ideas. Great for design/naming/architecture calls. *(Inspired by [claude-adhd](https://github.com/UditAkhourii/adhd).)* |
 | **`scrooge-verify`** | A real verification gate. Detects your toolchain, runs build/typecheck/test (free, ground truth — a non-zero exit is an objective FAIL), then asks a cheap model whether the evidence actually supports a `--claim` (catching "green tests that don't exercise the change"). |
 | **`scrooge-drift`** | Keeps the registry honest. Diffs each provider's *live* model list against what the registry routes to: **DEAD** = registry points at a retired model (calls will fail — fix now), **NEW** = a current-gen model you haven't adopted yet. Exit 1 on drift; run it weekly via cron so the registry never silently rots. |
-| **`scrooge-capabilities`** | Refreshes per-model **quality scores** (Artificial Analysis Intelligence/Coding/Math indices + GPQA + speed, plus OpenRouter context/modality) into `capabilities.json`, which powers capability-aware routing (below). Run weekly via cron. Needs a free [Artificial Analysis](https://artificialanalysis.ai/) key in `$AA_API_KEY`. |
+| **`scrooge-capabilities`** | Refreshes per-model **quality scores** (Artificial Analysis Intelligence/Coding/Math indices + GPQA + speed, plus OpenRouter context/modality) into `capabilities.json`, which powers capability-aware routing (below). The installer schedules it weekly. **Optional** — routing already works from the shipped seed; this keeps scores current and wants a *free* [Artificial Analysis](https://artificialanalysis.ai/) key (`$AA_API_KEY`). |
 | **`scrooge learn` / `lessons` / `forget`** | **Live training.** Accumulates short, per-model corrective guardrails learned from observed failures and auto-injects the relevant ones into the model's system prompt at routing time — so recurring cheap-model bugs are preempted, not re-fixed (and re-paid for) on every call. See [Live training](#live-training-per-model-lessons) below. |
 | **Claude Code gate** *(opt-in)* | A `diverge` skill, an `adversarial-verifier` agent, a `Stop`/`SubagentStop` hook that **blocks "done" claims with no build/test evidence**, and a `PreToolUse` hook (`scrooge-announce.py`) that drops an inline marker whenever the agent delegates to scrooge (nudging you to open `scrooge watch`). Offered during `scrooge setup`. |
 
@@ -143,6 +143,28 @@ How it works:
 > Reality check: capability routing won't spread *easy* work across many models — for a uniform
 > easy batch (e.g. classification), one cheap model is genuinely the right answer. The payoff is
 > **escalation** on hard tasks and **throughput** via `--spread`.
+
+### The Artificial Analysis key — optional, free, and where to put it
+
+Capability routing **works the moment you install** — the repo ships `capabilities.seed.json`
+with real benchmark scores, so nothing extra is required to get smart routing. The only thing
+the [Artificial Analysis](https://artificialanalysis.ai/) key adds is the **weekly auto-refresh**
+that keeps those scores current as models change (new releases, retired ids, shifting quality).
+
+- **Why bother:** models move fast. Without a refresh, routing decisions slowly drift from
+  reality. With it, `scrooge-capabilities` pulls fresh Intelligence/Coding/Math/GPQA/speed numbers
+  every week, no babysitting.
+- **It's free:** create an account at [artificialanalysis.ai](https://artificialanalysis.ai/),
+  open the API/Insights section, and generate a key (their free tier covers this; attribution to
+  artificialanalysis.ai is requested).
+- **Where it goes:** the **`scrooge setup`** wizard prompts for it (Enter to skip), or add it
+  yourself any time:
+  ```bash
+  echo 'AA_API_KEY=aa_xxxxxxxx' >> ~/.token-scrooge/.env   # chmod 600, gitignored, never committed
+  scrooge-capabilities                                      # refresh now (otherwise it runs weekly)
+  ```
+- **Skip it entirely** and everything still works — you just keep the shipped seed scores until you
+  edit them by hand. (`scrooge-capabilities` also pulls OpenRouter context/modality with *no* AA key.)
 
 ## Live training (per-model lessons)
 

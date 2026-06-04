@@ -1128,6 +1128,19 @@ def cmd_setup(args):
         if val:
             new_keys[(env_names[0] if env_names else provider.upper() + "_API_KEY")] = val
             print("       " + OKc("✓ added"))
+    # Optional Artificial Analysis key — powers capability-aware routing's WEEKLY score refresh.
+    # Routing already works from the shipped capabilities.seed.json; this just keeps the numbers
+    # current as models change. Free key: artificialanalysis.ai (create account → API).
+    if os.environ.get("AA_API_KEY") or os.environ.get("ARTIFICIAL_ANALYSIS_API_KEY"):
+        print("   %s %-11s %s" % (GOLD("●"), "capability", GREYc("AA key detected · model quality scores will auto-refresh weekly")))
+    else:
+        print("   %s %-11s %s" % (GREYc("○"), "capability", GREYc("optional · keeps model quality scores fresh for smart routing")))
+        print("       " + GREYc("free key at artificialanalysis.ai (account → API). Skip and scrooge still"))
+        print("       " + GREYc("routes from the shipped scores — this only enables the weekly refresh."))
+        aav = _ask_secret("       ↳ paste Artificial Analysis key (or Enter to skip): ")
+        if aav:
+            new_keys["AA_API_KEY"] = aav
+            print("       " + OKc("✓ added — weekly capability refresh enabled"))
     env_path = _write_env_file(new_keys)
     json.dump(reg, open(REGISTRY, "w"), indent=2); open(REGISTRY, "a").write("\n")
     print("   " + OKc("✓") + " keys saved to " + GOLD(env_path.replace(HOME, "~")) + GREYc(" (chmod 600)"))
