@@ -20,6 +20,7 @@ Usage:
   scrooge models <provider>                 # list live model ids from a provider
   scrooge list                              # show registry (providers/models/tasks)
   scrooge ledger [--since 24h|7d|all]       # usage + cost totals, savings vs Opus
+  scrooge watch  [--tail N|--all]           # LIVE feed of cheap-model calls as they happen
 
 Live training (per-model lessons): short corrective guardrails, learned from
 observed failures, are auto-injected into the model's system prompt at routing
@@ -417,9 +418,15 @@ def cmd_call(reg, args):
     tin = usage.get("prompt_tokens") or 0
     tout = usage.get("completion_tokens") or 0
     c = cost_usd(reg, model, tin, tout)
+    # A short, whitespace-collapsed preview so `scrooge watch` can show WHAT each cheap
+    # model is doing in real time. Local-only (the ledger is gitignored); opt out with
+    # SCROOGE_NO_PREVIEW=1 if you'd rather not write any prompt text to disk.
+    preview = "" if os.environ.get("SCROOGE_NO_PREVIEW", "").lower() in ("1", "true", "yes") \
+              else " ".join(prompt.split())[:100]
     line_no = append_ledger({"ts": int(t0), "provider": provider, "model": model, "task": args.task,
                              "tokens_in": tin, "tokens_out": tout, "cost_usd": round(c, 6),
-                             "duration_ms": int(dt*1000), "ok": True, "prompt_chars": len(prompt)})
+                             "duration_ms": int(dt*1000), "ok": True, "prompt_chars": len(prompt),
+                             "prompt_preview": preview})
     err(ORANGE("🪙 scrooge ✓ %s/%s · %d→%d tok · ~$%.5f · %.1fs%s" %
                (provider, model, tin, tout, c, dt, (" · ledger#%d" % line_no) if line_no else "")))
     sys.stdout.write(text)
@@ -499,6 +506,95 @@ def cmd_ledger(reg, args):
     print("\n  by model:")
     for k, d in sorted(by.items(), key=lambda x: -x[1]["cost"]):
         print("    %-28s %3d calls  $%.4f  (%s→%s tok)" % (k, d["n"], d["cost"], f"{d['tin']:,}", f"{d['tout']:,}"))
+
+def cmd_watch(reg, args):
+    """Live feed of every cheap-model call as it hits the ledger — a real-time view of
+    the orchestrator delegating grunt work. Catches foreground, background, and subagent
+    calls alike (they all append to the ledger). Keep it open in a side pane."""
+    try:
+        sys.stdout.reconfigure(line_buffering=True)   # flush each line even when piped/backgrounded
+    except Exception:
+        pass
+    orch = reg.get("orchestrator") or {}
+    base_in, base_out = orch.get("cost_in", OPUS_IN), orch.get("cost_out", OPUS_OUT)
+    orch_name = orch.get("name", "Opus")
+    tot = {"n": 0, "cost": 0.0, "tin": 0, "tout": 0}
+
+    def render(o):
+        ts = time.strftime("%H:%M:%S", time.localtime(o.get("ts", 0)))
+        pm = "%s/%s" % (o.get("provider"), o.get("model"))
+        tag = AMBER("[%s]" % o["task"]) if o.get("task") else GREYc("[·]")
+        if not o.get("ok", False):
+            return "%s %s %s %s  %s" % (GREYc(ts), ERRc("✗"), GOLD(pm), tag,
+                                        ERRc(str(o.get("error", "error"))))
+        tin, tout = o.get("tokens_in", 0), o.get("tokens_out", 0)
+        dur = o.get("duration_ms", 0) / 1000.0
+        prev = (o.get("prompt_preview") or "").strip()
+        return "%s %s %s %s %s %s %s%s" % (
+            GREYc(ts), OKc("✓"), GOLD(pm), tag,
+            GREYc("%d→%d tok" % (tin, tout)), AMBER("$%.5f" % o.get("cost_usd", 0)),
+            GREYc("%.1fs" % dur), ("  " + GREYc("· " + prev)) if prev else "")
+
+    def summary(final=False):
+        if not tot["n"]:
+            if final:
+                print(GREYc("  (no calls observed while watching)"))
+            return
+        equiv = (tot["tin"] / 1e6) * base_in + (tot["tout"] / 1e6) * base_out
+        saved = equiv - tot["cost"]
+        pct = (100 * (1 - tot["cost"] / equiv)) if equiv > 0 else 0
+        print(AMBER("  ── %d calls · $%.4f cheap · ~$%.2f on %s · saved ~$%.2f (%.0f%%) ──"
+                    % (tot["n"], tot["cost"], equiv, orch_name, saved, pct)))
+
+    def show(o):
+        print(render(o))
+        if o.get("ok"):
+            tot["n"] += 1; tot["cost"] += o.get("cost_usd", 0)
+            tot["tin"] += o.get("tokens_in", 0); tot["tout"] += o.get("tokens_out", 0)
+            if tot["n"] % 10 == 0:
+                summary()
+
+    path = LEDGER
+    print(GOLD(BOLD("🪙 scrooge watch")) +
+          GREYc("  following %s  ·  Ctrl-C to stop" % path.replace(HOME, "~")))
+    # Where to start: --all replays the whole ledger; otherwise follow only NEW calls
+    # (so you literally watch them happen), with --tail N backfilling recent context.
+    last = 0
+    if os.path.exists(path):
+        last = 0 if args.all else os.path.getsize(path)
+    if args.tail and not args.all and os.path.exists(path):
+        with open(path, "rb") as fh:
+            recent = [l for l in fh.read().split(b"\n") if l.strip()][-args.tail:]
+        for bl in recent:
+            try: show(json.loads(bl.decode("utf-8", "replace")))
+            except Exception: pass
+    try:
+        while True:
+            if not os.path.exists(path):
+                time.sleep(0.5); continue
+            size = os.path.getsize(path)
+            if size < last:      # truncated / rotated
+                last = 0
+            if size > last:
+                with open(path, "rb") as fh:
+                    fh.seek(last)
+                    raw = fh.read()
+                cut = raw.rfind(b"\n")
+                if cut != -1:
+                    chunk = raw[:cut + 1]
+                    last += len(chunk)
+                    for bl in chunk.split(b"\n"):
+                        if not bl.strip():
+                            continue
+                        try: show(json.loads(bl.decode("utf-8", "replace")))
+                        except Exception: pass
+            if not args.follow:
+                break
+            time.sleep(0.3)
+    except KeyboardInterrupt:
+        pass
+    print()
+    summary(final=True)
 
 # ---- live-training subcommands (learn / lessons / forget) ---------------
 def cmd_learn(reg, args):
@@ -790,6 +886,7 @@ def _install_claude_gate():
     claude = os.path.join(HOME, ".claude")
     copies = [
         (os.path.join(repo, "hooks", "verify-done-gate.py"), os.path.join(claude, "hooks", "verify-done-gate.py")),
+        (os.path.join(repo, "hooks", "scrooge-announce.py"), os.path.join(claude, "hooks", "scrooge-announce.py")),
         (os.path.join(repo, "agents", "adversarial-verifier.md"), os.path.join(claude, "agents", "adversarial-verifier.md")),
         (os.path.join(repo, "skills", "diverge", "SKILL.md"), os.path.join(claude, "skills", "diverge", "SKILL.md")),
     ]
@@ -807,13 +904,19 @@ def _install_claude_gate():
         except Exception: settings = {}
     hooks = settings.setdefault("hooks", {})
     gate = {"type": "command", "command": "python3 %s" % os.path.join(claude, "hooks", "verify-done-gate.py")}
-    def _has(arr): return any(any("verify-done-gate.py" in h.get("command","") for h in e.get("hooks",[])) for e in arr)
+    def _has(arr, needle): return any(any(needle in h.get("command","") for h in e.get("hooks",[])) for e in arr)
     for ev in ("Stop", "SubagentStop"):
         arr = hooks.setdefault(ev, [])
-        if not _has(arr):
+        if not _has(arr, "verify-done-gate.py"):
             arr.append({"hooks": [gate]})
+    # surface scrooge delegations live (PreToolUse on Bash)
+    announce = {"type": "command", "command": "python3 %s" % os.path.join(claude, "hooks", "scrooge-announce.py")}
+    pre = hooks.setdefault("PreToolUse", [])
+    if not _has(pre, "scrooge-announce.py"):
+        pre.append({"matcher": "Bash", "hooks": [announce]})
     json.dump(settings, open(sp, "w"), indent=2); open(sp, "a").write("\n")
     print("  ✓ wired verify-done-gate.py into Stop + SubagentStop (%s)" % sp.replace(HOME, "~"))
+    print("  ✓ wired scrooge-announce.py into PreToolUse(Bash) — marks cheap-model delegations")
     print(DIM("  (disable a block any time with VERIFY_DONE_GATE_OFF=1)"))
 
 def cmd_setup(args):
@@ -915,7 +1018,7 @@ def main():
     reg = load_registry()
 
     # Manual subcommand dispatch (avoids argparse subparser vs positional-prompt clash).
-    if argv and argv[0] in ("models", "list", "ledger", "learn", "lessons", "forget"):
+    if argv and argv[0] in ("models", "list", "ledger", "watch", "learn", "lessons", "forget"):
         cmd, rest = argv[0], argv[1:]
         if cmd == "models":
             ap = argparse.ArgumentParser(prog="scrooge models"); ap.add_argument("provider")
@@ -925,6 +1028,13 @@ def main():
         if cmd == "ledger":
             ap = argparse.ArgumentParser(prog="scrooge ledger"); ap.add_argument("--since", default="24h")
             return cmd_ledger(reg, ap.parse_args(rest))
+        if cmd == "watch":
+            ap = argparse.ArgumentParser(prog="scrooge watch")
+            ap.add_argument("--tail", type=int, default=3, help="show the last N calls before following")
+            ap.add_argument("--all", action="store_true", help="replay the entire ledger, then follow")
+            ap.add_argument("--no-follow", action="store_false", dest="follow",
+                            help="print matching calls and exit (don't stream)")
+            return cmd_watch(reg, ap.parse_args(rest))
         if cmd == "learn":
             ap = argparse.ArgumentParser(prog="scrooge learn")
             ap.add_argument("--model", "-m")

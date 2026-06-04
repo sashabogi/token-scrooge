@@ -37,11 +37,24 @@ scrooge ledger                                 # spend + savings vs your orchest
 scrooge-drift                                  # is the registry still current? (run weekly)
 ```
 
-Every call prints a loud banner, so an external model never runs silently:
+Every call prints a loud banner **to stderr**, so an external model never runs silently:
 
 ```
 🪙 scrooge ▸ deepseek/deepseek-v4-flash  [task: summarize]
 🪙 scrooge ✓ deepseek/deepseek-v4-flash · 1240→830 tok · ~$0.00041 · 1.4s · ledger#23
+```
+
+In a terminal you see this directly. When an **agent** drives scrooge, the banner lands
+in that subprocess's captured output — easy to miss, and invisible for background or
+subagent calls. So for live visibility regardless of who's calling, keep a
+**`scrooge watch`** pane open — it tails the ledger and streams *every* call as it
+happens (model · task · tokens · cost · what it's doing) with a rolling savings line:
+
+```
+🪙 scrooge watch  following ~/.token-scrooge/calls.jsonl  ·  Ctrl-C to stop
+14:22:31 ✓ deepseek/deepseek-v4-flash [code]      70→35 tok  $0.00002  1.3s  · draft a retry wrapper
+14:22:33 ✓ gemini/gemini-2.5-flash-lite [summarize] 980→120 tok $0.00007 0.6s · summarize: changelog.md
+  ── 12 calls · $0.0041 cheap · ~$1.40 on Claude Opus · saved ~$1.39 (99%) ──
 ```
 
 ## What's inside
@@ -49,11 +62,12 @@ Every call prints a loud banner, so an external model never runs silently:
 | Command | What it does |
 |---|---|
 | **`scrooge`** | Routes one task to the cheapest capable model (`--task` or `--model`), prints a transparency banner, logs cost. `scrooge ledger` shows spend + savings; `scrooge list` / `scrooge models <provider>` introspect; `scrooge setup` re-runs the wizard. |
+| **`scrooge watch`** | **Live feed of every cheap-model call** as it lands in the ledger — model · task · tokens · cost · prompt preview, with a rolling savings line. Catches foreground, background, *and* subagent calls (they all log). Keep it open in a side pane to literally watch the orchestrator delegate in real time. `--all` replays history; `--tail N` backfills recent context. |
 | **`scrooge-diverge`** | "Diverge → focus" idea generator. Fans N isolated cognitive frames across *different* cheap model families in parallel (no shared context = no anchoring), then a critic clusters and flags seductive-but-broken ideas. Great for design/naming/architecture calls. *(Inspired by [claude-adhd](https://github.com/UditAkhourii/adhd).)* |
 | **`scrooge-verify`** | A real verification gate. Detects your toolchain, runs build/typecheck/test (free, ground truth — a non-zero exit is an objective FAIL), then asks a cheap model whether the evidence actually supports a `--claim` (catching "green tests that don't exercise the change"). |
 | **`scrooge-drift`** | Keeps the registry honest. Diffs each provider's *live* model list against what the registry routes to: **DEAD** = registry points at a retired model (calls will fail — fix now), **NEW** = a current-gen model you haven't adopted yet. Exit 1 on drift; run it weekly via cron so the registry never silently rots. |
 | **`scrooge learn` / `lessons` / `forget`** | **Live training.** Accumulates short, per-model corrective guardrails learned from observed failures and auto-injects the relevant ones into the model's system prompt at routing time — so recurring cheap-model bugs are preempted, not re-fixed (and re-paid for) on every call. See [Live training](#live-training-per-model-lessons) below. |
-| **Claude Code gate** *(opt-in)* | A `diverge` skill, an `adversarial-verifier` agent, and a `Stop`/`SubagentStop` hook that **blocks "done" claims with no build/test evidence**. Offered during `scrooge setup`. |
+| **Claude Code gate** *(opt-in)* | A `diverge` skill, an `adversarial-verifier` agent, a `Stop`/`SubagentStop` hook that **blocks "done" claims with no build/test evidence**, and a `PreToolUse` hook (`scrooge-announce.py`) that drops an inline marker whenever the agent delegates to scrooge (nudging you to open `scrooge watch`). Offered during `scrooge setup`. |
 
 ## How it works
 
