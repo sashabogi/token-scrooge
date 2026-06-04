@@ -199,6 +199,24 @@ def default_model(reg, latest=False):
     return priced[0][0], priced[0][1]
 
 # ---- ledger -------------------------------------------------------------
+def project_label(start=None):
+    """A stable per-project name so a single shared ledger can be filtered by project.
+    Priority: $SCROOGE_PROJECT (explicit, set it per terminal for full control) →
+    nearest enclosing git repo's dir name → the cwd's base name."""
+    env = os.environ.get("SCROOGE_PROJECT")
+    if env:
+        return env
+    base = start or os.getcwd()
+    cur = base
+    for _ in range(40):
+        if os.path.isdir(os.path.join(cur, ".git")):
+            return os.path.basename(cur) or cur
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return os.path.basename(base.rstrip("/")) or base
+
 def append_ledger(entry):
     try:
         os.makedirs(SCROOGE_DIR, exist_ok=True)
@@ -352,6 +370,9 @@ def cmd_call(reg, args):
     if not prompt or not prompt.strip():
         raise SystemExit("Empty prompt.")
 
+    cwd = os.getcwd()
+    proj = project_label(cwd)   # stamped on the ledger so `scrooge watch --here` can filter
+
     base = reg["providers"][provider]["base_url"].rstrip("/")
     url = base + "/chat/completions"
     headers = {"Authorization": "Bearer " + key, "Content-Type": "application/json"}
@@ -402,11 +423,13 @@ def cmd_call(reg, args):
         body = e.read().decode(errors="replace")[:500]
         err(RED("🪙 scrooge ✗ %s/%s HTTP %s: %s" % (provider, model, e.code, body)))
         append_ledger({"ts": int(t0), "provider": provider, "model": model, "task": args.task,
+                       "project": proj, "cwd": cwd,
                        "ok": False, "error": "HTTP %s" % e.code, "duration_ms": int((time.time()-t0)*1000)})
         raise SystemExit(2)
     except Exception as e:
         err(RED("🪙 scrooge ✗ %s/%s: %s" % (provider, model, e)))
         append_ledger({"ts": int(t0), "provider": provider, "model": model, "task": args.task,
+                       "project": proj, "cwd": cwd,
                        "ok": False, "error": str(e), "duration_ms": int((time.time()-t0)*1000)})
         raise SystemExit(2)
 
@@ -424,6 +447,7 @@ def cmd_call(reg, args):
     preview = "" if os.environ.get("SCROOGE_NO_PREVIEW", "").lower() in ("1", "true", "yes") \
               else " ".join(prompt.split())[:100]
     line_no = append_ledger({"ts": int(t0), "provider": provider, "model": model, "task": args.task,
+                             "project": proj, "cwd": cwd,
                              "tokens_in": tin, "tokens_out": tout, "cost_usd": round(c, 6),
                              "duration_ms": int(dt*1000), "ok": True, "prompt_chars": len(prompt),
                              "prompt_preview": preview})
@@ -470,6 +494,7 @@ def parse_since(s):
 
 def cmd_ledger(reg, args):
     since = parse_since(args.since)
+    want_proj = project_label(os.getcwd()) if getattr(args, "here", False) else getattr(args, "project", None)
     if not os.path.exists(LEDGER):
         print("No calls logged yet."); return
     rows = []
@@ -479,10 +504,13 @@ def cmd_ledger(reg, args):
                 o = json.loads(line)
             except Exception:
                 continue
+            if want_proj and (o.get("project") or "") != want_proj:
+                continue
             if o.get("ts", 0) >= since and o.get("ok"):
                 rows.append(o)
+    scope = (" · project=%s" % want_proj) if want_proj else ""
     if not rows:
-        print("No successful calls in window '%s'." % args.since); return
+        print("No successful calls in window '%s'%s." % (args.since, scope)); return
     orch = reg.get("orchestrator") or {}
     base_in = orch.get("cost_in", OPUS_IN)
     base_out = orch.get("cost_out", OPUS_OUT)
@@ -497,7 +525,7 @@ def cmd_ledger(reg, args):
         d = by.setdefault(k, {"n": 0, "cost": 0, "tin": 0, "tout": 0})
         d["n"] += 1; d["cost"] += r.get("cost_usd", 0)
         d["tin"] += r.get("tokens_in", 0); d["tout"] += r.get("tokens_out", 0)
-    print("SCROOGE LEDGER — window: %s   (%d calls)" % (args.since, len(rows)))
+    print("SCROOGE LEDGER — window: %s%s   (%d calls)" % (args.since, scope, len(rows)))
     print("  tokens: %s in / %s out" % (f"{tin:,}", f"{tout:,}"))
     print("  spent on cheap models: $%.4f" % total_cost)
     print("  same tokens on %s: ~$%.2f" % (orch_name, orch_equiv))
@@ -520,18 +548,33 @@ def cmd_watch(reg, args):
     orch_name = orch.get("name", "Opus")
     tot = {"n": 0, "cost": 0.0, "tin": 0, "tout": 0}
 
+    # ---- per-project filter (many projects share one ledger) ----------------
+    want_proj = project_label(os.getcwd()) if getattr(args, "here", False) else getattr(args, "project", None)
+    cwd_prefix = os.path.abspath(os.path.expanduser(args.cwd)) if getattr(args, "cwd", None) else None
+    single = bool(want_proj or cwd_prefix)   # single-project view → no per-line project tag
+
+    def matches(o):
+        if want_proj and (o.get("project") or "") != want_proj:
+            return False
+        if cwd_prefix:
+            c = o.get("cwd") or ""
+            if not (c == cwd_prefix or c.startswith(cwd_prefix.rstrip("/") + "/")):
+                return False
+        return True
+
     def render(o):
         ts = time.strftime("%H:%M:%S", time.localtime(o.get("ts", 0)))
         pm = "%s/%s" % (o.get("provider"), o.get("model"))
         tag = AMBER("[%s]" % o["task"]) if o.get("task") else GREYc("[·]")
+        pfx = "" if single else GREYc("%-16s " % (o.get("project") or "?")[:16])
         if not o.get("ok", False):
-            return "%s %s %s %s  %s" % (GREYc(ts), ERRc("✗"), GOLD(pm), tag,
-                                        ERRc(str(o.get("error", "error"))))
+            return "%s%s %s %s %s  %s" % (pfx, GREYc(ts), ERRc("✗"), GOLD(pm), tag,
+                                          ERRc(str(o.get("error", "error"))))
         tin, tout = o.get("tokens_in", 0), o.get("tokens_out", 0)
         dur = o.get("duration_ms", 0) / 1000.0
         prev = (o.get("prompt_preview") or "").strip()
-        return "%s %s %s %s %s %s %s%s" % (
-            GREYc(ts), OKc("✓"), GOLD(pm), tag,
+        return "%s%s %s %s %s %s %s %s%s" % (
+            pfx, GREYc(ts), OKc("✓"), GOLD(pm), tag,
             GREYc("%d→%d tok" % (tin, tout)), AMBER("$%.5f" % o.get("cost_usd", 0)),
             GREYc("%.1fs" % dur), ("  " + GREYc("· " + prev)) if prev else "")
 
@@ -547,6 +590,8 @@ def cmd_watch(reg, args):
                     % (tot["n"], tot["cost"], equiv, orch_name, saved, pct)))
 
     def show(o):
+        if not matches(o):
+            return
         print(render(o))
         if o.get("ok"):
             tot["n"] += 1; tot["cost"] += o.get("cost_usd", 0)
@@ -555,8 +600,10 @@ def cmd_watch(reg, args):
                 summary()
 
     path = LEDGER
+    scope = ("project=%s" % want_proj) if want_proj else \
+            ("cwd=%s" % cwd_prefix.replace(HOME, "~")) if cwd_prefix else "all projects"
     print(GOLD(BOLD("🪙 scrooge watch")) +
-          GREYc("  following %s  ·  Ctrl-C to stop" % path.replace(HOME, "~")))
+          GREYc("  %s  ·  following %s  ·  Ctrl-C to stop" % (scope, path.replace(HOME, "~"))))
     # Where to start: --all replays the whole ledger; otherwise follow only NEW calls
     # (so you literally watch them happen), with --tail N backfilling recent context.
     last = 0
@@ -1026,7 +1073,10 @@ def main():
         if cmd == "list":
             return cmd_list(reg, None)
         if cmd == "ledger":
-            ap = argparse.ArgumentParser(prog="scrooge ledger"); ap.add_argument("--since", default="24h")
+            ap = argparse.ArgumentParser(prog="scrooge ledger")
+            ap.add_argument("--since", default="24h")
+            ap.add_argument("--here", action="store_true", help="only this project (cwd's git repo / dir)")
+            ap.add_argument("--project", help="only this project name (see SCROOGE_PROJECT)")
             return cmd_ledger(reg, ap.parse_args(rest))
         if cmd == "watch":
             ap = argparse.ArgumentParser(prog="scrooge watch")
@@ -1034,6 +1084,10 @@ def main():
             ap.add_argument("--all", action="store_true", help="replay the entire ledger, then follow")
             ap.add_argument("--no-follow", action="store_false", dest="follow",
                             help="print matching calls and exit (don't stream)")
+            ap.add_argument("--here", action="store_true",
+                            help="only THIS project (cwd's git repo / dir) — run it in the project's terminal")
+            ap.add_argument("--project", help="only this project name (the SCROOGE_PROJECT / git-dir label)")
+            ap.add_argument("--cwd", help="only calls whose working dir is under this path")
             return cmd_watch(reg, ap.parse_args(rest))
         if cmd == "learn":
             ap = argparse.ArgumentParser(prog="scrooge learn")
