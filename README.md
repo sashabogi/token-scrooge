@@ -5,16 +5,26 @@
 <h1 align="center">Token Scrooge</h1>
 
 <p align="center">
-  <b>Make the cheap models do the grunt work.</b><br>
-  Your orchestrator stays in charge — routine, disconnected tasks get delegated to cheap LLMs you already pay for,<br>
-  with a live cost ledger and a verification gate so the savings never cost you quality.
+  <b>Your $75-per-million-tokens genius shouldn't be summarizing changelogs.</b><br>
+  Token Scrooge fires your frontier model from the grunt work, hands it to cheap LLMs that do it
+  <b>30–100× cheaper</b>, and shows you every delegation live — with receipts.
 </p>
 
 ---
 
-Frontier models (Claude Opus, GPT, Gemini Pro, …) are the best *orchestrators* — and the most expensive tokens you'll spend. But most of what an agent actually *does* — drafting a function, summarizing a file, extracting data, judging whether a test covers a claim — doesn't need a frontier model. **Token Scrooge** routes that work to DeepSeek / Kimi / GLM / Gemini / OpenRouter / OpenAI / xAI — typically **30–100× cheaper** — while your smart model keeps doing the part only it's good at: orchestrating.
+You pay frontier prices (Claude Opus, GPT, Gemini Pro) for the one thing those models are uniquely great at: **orchestrating**. But most of what an agent actually *does* all day — draft a function, summarize a file, extract JSON, label 4,000 rows, judge whether a test covers a claim — is **grunt work a model costing 30–100× less does just as well.** Token Scrooge is a zero-dependency CLI (Python stdlib only) that routes that work to DeepSeek / Kimi / GLM / Gemini / OpenAI / xAI / OpenRouter while your expensive model stays in charge.
 
-It's **orchestrator-agnostic**: drive with Claude, GPT, Gemini, Grok — or, if you're truly thrifty, a cheap flagship like DeepSeek or Kimi.
+In one real session that meant **218 delegated calls for \$0.15** — the same tokens on Opus would've cost **~\$20. A 99% cut**, with a live ledger to prove it.
+
+And it's not naïve "always grab the cheapest." Token Scrooge:
+
+- **🎯 Routes by capability, not just price** — weighs each model's *benchmarked skill for the task* against cost, escalating **hard** work to a stronger model while keeping **easy** work cheap. (Backed by live [Artificial Analysis](https://artificialanalysis.ai/) scores, refreshed weekly.)
+- **📺 Shows its work live** — `scrooge watch` streams every cheap-model call as it happens (model · task · cost · *what it's doing*), filterable per project.
+- **🧠 Learns from its mistakes** — when a cheap model repeats a bug, capture a one-line lesson and it's auto-injected into that model's prompt from then on.
+- **🔄 Keeps itself current** — weekly refreshers pull live model lists, prices, and quality benchmarks so routing never silently rots.
+- **🧾 Never runs silently** — a loud banner + a cost ledger on every call. Nothing happens behind your back, and the savings are always provable.
+
+It's **orchestrator-agnostic**: drive with Claude, GPT, Gemini, or Grok — or, if you're truly thrifty, a cheap flagship like DeepSeek or Kimi. **Bring your own keys** (any subset — even one provider).
 
 ## Quickstart
 
@@ -29,13 +39,18 @@ The **setup wizard** asks two things and writes everything for you — no hand-e
 2. **API keys** — auto-detects any already in your environment, prompts (masked) for the rest, then **live-tests each one** and offers to re-enter any that fail. Keys go to `~/.token-scrooge/.env` (chmod 600) — never your shell profile, never the repo.
 
 ```bash
-scrooge list                                   # what's live
+scrooge list                                   # what's live (with capability scores)
 scrooge "draft a regex for E.164 phone numbers"
-scrooge --task summarize < bigfile.md          # cheapest capable model for the task
+scrooge -t summarize < bigfile.md              # best-value model for the task
+scrooge -t code -d hard "design a lock-free queue"   # hard → escalates to a stronger model
+scrooge -t code --spread 3 < batch.txt         # fan a batch across the top-3 capable models
 scrooge --model kimi --json "extract the prices as JSON"
+scrooge watch --here                           # live feed of this project's delegations
 scrooge ledger                                 # spend + savings vs your orchestrator
-scrooge-drift                                  # is the registry still current? (run weekly)
 ```
+
+The installer also schedules two **weekly self-maintenance** jobs (macOS LaunchAgent / Linux cron):
+`scrooge-capabilities` (refresh model quality scores) and you can add `scrooge-drift` (flag retired/new models) the same way — so routing tracks reality with zero babysitting.
 
 Every call prints a loud banner **to stderr**, so an external model never runs silently:
 
@@ -68,7 +83,7 @@ scrooge watch --here     # only this repo's calls (auto-detected from the git ro
 
 | Command | What it does |
 |---|---|
-| **`scrooge`** | Routes one task to the cheapest capable model (`--task` or `--model`), prints a transparency banner, logs cost. `scrooge ledger` shows spend + savings; `scrooge list` / `scrooge models <provider>` introspect; `scrooge setup` re-runs the wizard. |
+| **`scrooge`** | Routes one task to the **best-value** model — weighing benchmarked capability for the task against cost, gated by difficulty (`--task` + `--difficulty`, or `--model` to force one). `--spread N` fans a batch across models. Prints a transparency banner, logs cost. `scrooge ledger` shows spend + savings; `scrooge list` / `scrooge models <provider>` introspect; `scrooge setup` re-runs the wizard. |
 | **`scrooge watch`** | **Live feed of every cheap-model call** as it lands in the ledger — model · task · tokens · cost · prompt preview, with a rolling savings line. Catches foreground, background, *and* subagent calls (they all log). Keep it open in a side pane to literally watch the orchestrator delegate in real time. **Many projects share one ledger**, so each call is stamped with its project (git-repo / dir name, or `$SCROOGE_PROJECT`): run `scrooge watch --here` in a project's terminal to see **only that project**, `--project <name>` to pick one, or plain `scrooge watch` to see all (each line tagged). `--all` replays history; `--tail N` backfills. (`scrooge ledger --here` totals savings for one project.) |
 | **`scrooge-diverge`** | "Diverge → focus" idea generator. Fans N isolated cognitive frames across *different* cheap model families in parallel (no shared context = no anchoring), then a critic clusters and flags seductive-but-broken ideas. Great for design/naming/architecture calls. *(Inspired by [claude-adhd](https://github.com/UditAkhourii/adhd).)* |
 | **`scrooge-verify`** | A real verification gate. Detects your toolchain, runs build/typecheck/test (free, ground truth — a non-zero exit is an objective FAIL), then asks a cheap model whether the evidence actually supports a `--claim` (catching "green tests that don't exercise the change"). |
@@ -193,6 +208,19 @@ nothing.
 ## Install as a Claude Code plugin
 
 The repo ships a plugin manifest (`.claude-plugin/plugin.json`) bundling the `diverge` skill and `adversarial-verifier` agent. The CLIs and the Stop-hook are installed by `install.sh` / `scrooge setup`.
+
+## Tests
+
+Hermetic, offline, no API keys — they spin up a throwaway `$SCROOGE_HOME` and assert the
+real behaviour (capability routing & difficulty escalation, `--spread` distribution,
+per-project `watch`/`ledger` filtering, the lessons round-trip, and corrupt/missing-store
+resilience):
+
+```bash
+./tests/run.sh        # byte-compile + routing unit tests + CLI checks; exit 0 = all green
+```
+
+Run it after any change — a red line means a regression before you ship.
 
 ## Caveats
 

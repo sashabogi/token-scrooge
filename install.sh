@@ -66,6 +66,61 @@ fi
 
 say "✓ Installed: scrooge, scrooge-diverge, scrooge-verify, scrooge-drift, scrooge-capabilities → $BIN_DIR"
 
+# --- weekly self-maintenance: refresh model quality scores (capability routing) ----------
+# macOS uses a user LaunchAgent (no Full Disk Access needed, unlike crontab); Linux uses cron.
+# Idempotent and non-fatal — a failure here never blocks the install.
+setup_weekly_refresh() {
+  local tool="$BIN_DIR/scrooge-capabilities"
+  local log="$SCROOGE_HOME/capabilities-refresh.log"
+  [ -x "$tool" ] || return 0
+  case "$(uname -s)" in
+    Darwin)
+      local label="com.tokenscrooge.capabilities"
+      local plist="$HOME/Library/LaunchAgents/$label.plist"
+      local py; py="$(command -v python3 || echo /usr/bin/python3)"
+      mkdir -p "$HOME/Library/LaunchAgents"
+      cat > "$plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$label</string>
+  <key>ProgramArguments</key>
+  <array><string>$py</string><string>$tool</string></array>
+  <key>StartCalendarInterval</key>
+  <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>9</integer><key>Minute</key><integer>5</integer></dict>
+  <key>StandardOutPath</key><string>$log</string>
+  <key>StandardErrorPath</key><string>$log</string>
+  <key>RunAtLoad</key><false/>
+</dict>
+</plist>
+PLIST
+      launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+      if launchctl bootstrap "gui/$(id -u)" "$plist" 2>/dev/null; then
+        say "✓ Weekly capability refresh scheduled (LaunchAgent · Mondays 09:05)."
+      else
+        say "ℹ LaunchAgent written to $plist — load it with: launchctl bootstrap gui/$(id -u) \"$plist\""
+      fi
+      ;;
+    *)
+      local line="5 9 * * 1 $tool > $log 2>&1"
+      if command -v crontab >/dev/null 2>&1; then
+        if crontab -l 2>/dev/null | grep -q "scrooge-capabilities"; then
+          say "✓ Weekly capability refresh already in crontab."
+        elif ( crontab -l 2>/dev/null; printf '%s\n' "$line" ) | crontab - 2>/dev/null; then
+          say "✓ Weekly capability refresh added to crontab (Mondays 09:05)."
+        else
+          say "ℹ Could not edit crontab automatically. Add this line yourself:"
+          say "    $line"
+        fi
+      else
+        say "ℹ No crontab found — schedule '$tool' weekly however you prefer."
+      fi
+      ;;
+  esac
+}
+setup_weekly_refresh || true
+
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
   *) say "⚠ $BIN_DIR is not on your PATH. Add it:"
