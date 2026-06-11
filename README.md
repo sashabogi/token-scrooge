@@ -1,3 +1,9 @@
+> ## 📦 This project moved into [Trantor](https://github.com/sashabogi/trantor)
+> Scrooge is now **the Trantor economics engine** — vendored at
+> [`trantor/engine/`](https://github.com/sashabogi/trantor/tree/main/engine) and installed
+> automatically by `trantor setup`. This repo is archived as the standalone original;
+> everything here continues to work, but new development happens in Trantor.
+
 <p align="center">
   <img src="assets/header.png" alt="Token Scrooge — make the cheap models do the grunt work" width="100%">
 </p>
